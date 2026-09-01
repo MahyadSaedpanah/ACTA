@@ -1,0 +1,12 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+logs/
+data/
+venv/
+*.py[cod]
+*.pt
+*.arff
+*.png
+*.pkl
+*.pickle
+*.xlsx
