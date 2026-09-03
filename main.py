@@ -20,7 +20,7 @@ parser.add_argument('--run_description', default='ACON', type=str, help='name of
 parser.add_argument('--da_method', default='ACON', type=str)
 
 # ========= Select the DATASET ==============
-parser.add_argument('--data_path', default='/home/mahyad/projects/ACON/data', type=str, help='Path containing dataset')
+parser.add_argument('--data_path', default=r"D:\ACTA\data", type=str, help='Path containing dataset')
 parser.add_argument('--dataset', default='UCIHAR',type=str)
 
 # ========= Select the BACKBONE ==============
