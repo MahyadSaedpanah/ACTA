@@ -47,10 +47,15 @@ class CNN(nn.Module):
         self.adaptive_pool = nn.AdaptiveAvgPool1d(configs.features_len)
         self.out_dim = configs.t_feat_dim
 
-    def forward(self, x_in):
+    def forward_features(self, x_in):
         x = self.conv_block1(x_in)
         x = self.conv_block2(x)
         x = self.conv_block3(x)
+        return x
+
+
+    def forward(self, x_in):
+        x = self.forward_features(x_in)
         x = self.adaptive_pool(x)
         x_flat = x.reshape(x.shape[0], -1)
         return x_flat
