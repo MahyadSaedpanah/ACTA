@@ -4,6 +4,7 @@ logs/
 data/
 venv/
 source_models/
+semantic_packages/
 *.py[cod]
 *.pt
 *.arff
