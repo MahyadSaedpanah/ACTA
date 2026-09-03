@@ -323,13 +323,54 @@ class da_trainer(object):
 
     def avg_result(self, df):
 
+        df = df.copy()
+
+        df["accuracy"] = pd.to_numeric(
+            df["accuracy"],
+            errors="coerce"
+        )
+
+        df["f1"] = pd.to_numeric(
+            df["f1"],
+            errors="coerce"
+        )
+
+    def avg_result(self, df):
+
         empty_row = [{'scenario': None, 'run_id': None, 'accuracy': None, 'f1': None}]
         df = pd.concat([df, pd.DataFrame(empty_row)], ignore_index=True)
 
-        mean_acc = df.groupby('scenario', as_index=False, sort=False)['accuracy'].mean(numeric_only=True)
-        mean_f1 = df.groupby('scenario', as_index=False, sort=False)['f1'].mean(numeric_only=True)
-        std_acc = df.groupby('scenario', as_index=False, sort=False)['accuracy'].std(numeric_only=True)
-        std_f1 =  df.groupby('scenario', as_index=False, sort=False)['f1'].std(numeric_only=True)
+        mean_acc = (
+            df.groupby(
+                "scenario",
+                as_index=False,
+                sort=False
+            )["accuracy"].mean()
+        )
+
+        mean_f1 = (
+            df.groupby(
+                "scenario",
+                as_index=False,
+                sort=False
+            )["f1"].mean()
+        )
+
+        std_acc = (
+            df.groupby(
+                "scenario",
+                as_index=False,
+                sort=False
+            )["accuracy"].std()
+        )
+
+        std_f1 = (
+            df.groupby(
+                "scenario",
+                as_index=False,
+                sort=False
+            )["f1"].std()
+        )
 
         print(mean_acc)
         print(std_acc)
