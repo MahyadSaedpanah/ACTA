@@ -172,6 +172,28 @@ class ACTA(Algorithm):
                 "0 <= momentum < 1."
             )
 
+        self.acta_mode = str(
+            getattr(
+                args,
+                "acta_mode",
+                "ACTA",
+            )
+        ).upper()
+
+        valid_modes = {
+            "ACTA",
+            "UTA",
+            "CLASSSHUFFLE",
+        }
+
+        if self.acta_mode not in valid_modes:
+            raise ValueError(
+                "acta_mode must be one of "
+                "{ACTA, UTA, ClassShuffle}."
+            )
+
+        self.class_shuffle_map = None
+
         # ----------------------------------------------------
         # Paths
         # ----------------------------------------------------
@@ -590,6 +612,13 @@ class ACTA(Algorithm):
             semantic_package_path
         )
 
+        if (
+            self.acta_mode
+            ==
+            "CLASSSHUFFLE"
+        ):
+            self._build_class_derangement()
+        
         self.is_configured = True
 
         # Ensure adaptation mode has frozen BN semantics
@@ -598,6 +627,131 @@ class ACTA(Algorithm):
         self.semantic_bank.eval()
 
         return self
+
+    # ========================================================
+    # Experimental semantic modes
+    # ========================================================
+
+    def _build_class_derangement(
+        self,
+    ):
+        """
+        Deterministic class derangement for the current seed.
+
+        Every task class receives semantic geometry from a
+        different class:
+
+            pi(c) != c
+
+        A dedicated generator makes this independent of all
+        training/dropout/reference RNG.
+        """
+
+        num_classes = int(
+            self.configs.num_classes
+        )
+
+        if num_classes < 2:
+            raise RuntimeError(
+                "ClassShuffle requires at least two classes."
+            )
+
+        generator = torch.Generator(
+            device="cpu"
+        )
+
+        generator.manual_seed(
+            int(self.seed)
+        )
+
+        identity = torch.arange(
+            num_classes
+        )
+
+        # With the small class counts used here this terminates
+        # essentially immediately.
+        while True:
+
+            permutation = torch.randperm(
+                num_classes,
+                generator=generator,
+            )
+
+            if torch.all(
+                permutation != identity
+            ):
+                break
+
+        self.class_shuffle_map = {
+            int(class_id):
+                int(
+                    permutation[
+                        class_id
+                    ].item()
+                )
+
+            for class_id
+            in range(
+                num_classes
+            )
+        }
+
+
+    def semantic_mapping_for_class(
+        self,
+        class_id,
+    ):
+        """
+        Return:
+
+            use_semantics,
+            semantic_geometry_class,
+            reliability_class
+
+        for the selected experimental mode.
+        """
+
+        class_id = int(
+            class_id
+        )
+
+        if self.acta_mode == "UTA":
+
+            return (
+                False,
+                class_id,
+                class_id,
+            )
+
+        if self.acta_mode == "ACTA":
+
+            return (
+                True,
+                class_id,
+                class_id,
+            )
+
+        if self.acta_mode == "CLASSSHUFFLE":
+
+            if self.class_shuffle_map is None:
+                raise RuntimeError(
+                    "ClassShuffle mapping has not "
+                    "been initialized."
+                )
+
+            return (
+                True,
+                int(
+                    self.class_shuffle_map[
+                        class_id
+                    ]
+                ),
+                class_id,
+            )
+
+        raise RuntimeError(
+            f"Unsupported ACTA mode: {self.acta_mode}"
+        )
 
 
     # ========================================================
@@ -694,7 +848,7 @@ class ACTA(Algorithm):
         self,
         target_temporal_features,
         class_id,
-        use_semantics=True,
+        use_semantics=None,
         k=None,
         return_details=False,
     ):
@@ -858,6 +1012,23 @@ class ACTA(Algorithm):
             )
         )
 
+        (
+            mode_use_semantics,
+            semantic_class_id,
+            reliability_class_id,
+        ) = self.semantic_mapping_for_class(
+            class_id
+        )
+
+        if use_semantics is None:
+            effective_use_semantics = (
+                mode_use_semantics
+            )
+        else:
+            effective_use_semantics = bool(
+                use_semantics
+            )
+        
         # ----------------------------------------------------
         # Shared ACTA/UTA alignment primitive
         # ----------------------------------------------------
@@ -873,7 +1044,13 @@ class ACTA(Algorithm):
                 class_id,
 
             use_semantics=
-                use_semantics,
+                effective_use_semantics,
+
+            semantic_class_id=
+                semantic_class_id,
+
+            reliability_class_id=
+                reliability_class_id,
 
             return_details=True,
         )
@@ -921,6 +1098,15 @@ class ACTA(Algorithm):
 
             "alignment_details":
                 details,
+
+            "semantic_class_id":
+                semantic_class_id,
+
+            "reliability_class_id":
+                reliability_class_id,
+
+            "mode":
+                self.acta_mode,
         }
 
 
@@ -932,7 +1118,7 @@ class ACTA(Algorithm):
         self,
         target_temporal_features,
         target_probabilities,
-        use_semantics=True,
+        use_semantics=None,
         k=None,
         return_details=False,
     ):
@@ -1289,7 +1475,6 @@ class ACTA(Algorithm):
         src_x,
         src_y,
         trg_x,
-        use_semantics=True,
     ):
         """
         Perform one Stage-B adaptation step.
@@ -1420,10 +1605,7 @@ class ACTA(Algorithm):
                 target_probabilities=
                     target_probabilities,
 
-                use_semantics=
-                    bool(
-                        use_semantics
-                    ),
+                use_semantics=None,
 
                 k=
                     self.reference_k,

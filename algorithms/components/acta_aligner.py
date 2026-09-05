@@ -715,6 +715,8 @@ class ACTAAlignmentCore(nn.Module):
         target_features,
         class_id=None,
         use_semantics=True,
+        semantic_class_id=None,
+        reliability_class_id=None,
         return_details=False,
     ):
         """
@@ -852,6 +854,12 @@ class ACTAAlignmentCore(nn.Module):
                     "semantic alignment is active."
                 )
 
+            if semantic_class_id is None:
+                semantic_class_id = class_id
+
+            if reliability_class_id is None:
+                reliability_class_id = class_id
+
             class_id = int(
                 class_id
             )
@@ -860,7 +868,14 @@ class ACTAAlignmentCore(nn.Module):
                 self.semantic_bank
                 .semantic_bonus(
                     class_id=
-                        class_id,
+                        int(
+                            semantic_class_id
+                        ),
+
+                    reliability_class_id=
+                        int(
+                            reliability_class_id
+                        ),
 
                     source_length=
                         semantic_length,

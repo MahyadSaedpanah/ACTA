@@ -514,18 +514,36 @@ class FrozenSemanticBank(nn.Module):
         lambda_sem=1.0,
         device=None,
         dtype=torch.float32,
+        reliability_class_id=None,
     ):
         """
-        Compute final ACTA semantic transition bonus:
+        Transition-aware semantic bonus.
 
-            lambda_sem
-            * kappa_c
-            * g_c(r_ijm) / rho_c
+        Normal ACTA:
+            geometry class    = class_id
+            reliability class = class_id
 
-        Returns
-        -------
-        [Ls, Lt, 4]
+        ClassShuffle:
+            geometry class    = shuffled class
+            reliability class = original task class
+
+        The score normalization belongs to the geometry model,
+        while kappa controls the reliability of the ORIGINAL
+        task class.
         """
+
+        class_id = int(
+            class_id
+        )
+
+        if reliability_class_id is None:
+            reliability_class_id = (
+                class_id
+            )
+
+        reliability_class_id = int(
+            reliability_class_id
+        )
 
         normalized = (
             self.normalized_transition_scores(
@@ -538,10 +556,7 @@ class FrozenSemanticBank(nn.Module):
         )
 
         kappa = self.class_kappa(
-            class_id
-        ).to(
-            device=normalized.device,
-            dtype=normalized.dtype,
+            reliability_class_id
         )
 
         return (
