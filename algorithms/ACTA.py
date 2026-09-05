@@ -1280,19 +1280,217 @@ class ACTA(Algorithm):
     # Implemented in Step 7.3 after reference sampling.
     # ========================================================
 
+    # ========================================================
+    # Full ACTA optimization step
+    # ========================================================
+
     def update(
         self,
         src_x,
         src_y,
         trg_x,
+        use_semantics=True,
     ):
+        """
+        Perform one Stage-B adaptation step.
 
-        raise NotImplementedError(
-            "ACTA.update() will be completed after "
-            "the class-indexed source reference "
-            "sampler is integrated."
+        Objective:
+
+            L_total
+                =
+                L_source
+                +
+                beta * L_align
+
+        where L_align is the EMA-weighted combination of
+        independently constructed class-specific alignments.
+
+        Parameters
+        ----------
+        src_x:
+            Labeled source minibatch.
+
+        src_y:
+            Source labels.
+
+        trg_x:
+            Unlabeled target minibatch.
+
+        use_semantics:
+            True  -> ACTA
+            False -> feature-only UTA
+
+        Notes
+        -----
+        Target labels are never accepted by this method.
+
+        EMA probabilities are detached evidence only.
+
+        Source reference features used by the alignment branch
+        are stop-gradient.
+
+        BatchNorm running statistics remain frozen.
+        """
+
+        self._require_configured()
+        self._require_reference_pool()
+
+        # ----------------------------------------------------
+        # Defensive adaptation-mode enforcement.
+        #
+        # Trainer calls algorithm.train(), but we enforce BN
+        # freezing here as well so a future trainer change
+        # cannot silently reintroduce BN contamination.
+        # ----------------------------------------------------
+
+        self.feature_extractor.train()
+        self.classifier.train()
+
+        self._set_batchnorm_eval(
+            self.feature_extractor
         )
 
+        self.ema_feature_extractor.eval()
+        self.ema_classifier.eval()
+        self.semantic_bank.eval()
+
+        # ----------------------------------------------------
+        # Fresh optimization step
+        # ----------------------------------------------------
+
+        self.optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        # ----------------------------------------------------
+        # 1. Supervised SOURCE objective
+        # ----------------------------------------------------
+
+        source_features = (
+            self.feature_extractor(
+                src_x
+            )
+        )
+
+        source_logits = (
+            self.classifier(
+                source_features
+            )
+        )
+
+        source_loss = (
+            self.cross_entropy(
+                source_logits,
+                src_y,
+            )
+        )
+
+        # ----------------------------------------------------
+        # 2. EMA target task evidence
+        #
+        # No target labels.
+        # ----------------------------------------------------
+
+        target_probabilities = (
+            self.ema_probabilities(
+                trg_x
+            )
+        )
+
+        # ----------------------------------------------------
+        # 3. Student target temporal representation
+        # ----------------------------------------------------
+
+        target_temporal_features = (
+            self.feature_extractor
+            .forward_features(
+                trg_x
+            )
+        )
+
+        # ----------------------------------------------------
+        # 4. Class-specific temporal alignment
+        # ----------------------------------------------------
+
+        alignment_loss = (
+            self.soft_class_conditioned_alignment(
+                target_temporal_features=
+                    target_temporal_features,
+
+                target_probabilities=
+                    target_probabilities,
+
+                use_semantics=
+                    bool(
+                        use_semantics
+                    ),
+
+                k=
+                    self.reference_k,
+
+                return_details=False,
+            )
+        )
+
+        # ----------------------------------------------------
+        # 5. Final ACTA objective
+        # ----------------------------------------------------
+
+        total_loss = (
+            source_loss
+            +
+            self.beta
+            *
+            alignment_loss
+        )
+
+        if not torch.isfinite(
+            total_loss
+        ):
+            raise RuntimeError(
+                "Non-finite ACTA total loss."
+            )
+
+        # ----------------------------------------------------
+        # 6. Student update
+        # ----------------------------------------------------
+
+        total_loss.backward()
+
+        self.optimizer.step()
+
+        # ----------------------------------------------------
+        # 7. EMA follows updated student
+        # ----------------------------------------------------
+
+        self.update_ema()
+
+        # ----------------------------------------------------
+        # Return plain scalars for existing Trainer meters.
+        # ----------------------------------------------------
+
+        return {
+            "Total_loss":
+                float(
+                    total_loss
+                    .detach()
+                    .item()
+                ),
+
+            "Source_loss":
+                float(
+                    source_loss
+                    .detach()
+                    .item()
+                ),
+
+            "Alignment_loss":
+                float(
+                    alignment_loss
+                    .detach()
+                    .item()
+                ),
+        }
 
     # ========================================================
     # Save / load adapted model
