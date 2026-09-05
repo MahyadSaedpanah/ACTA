@@ -925,6 +925,189 @@ class ACTA(Algorithm):
 
 
     # ========================================================
+    # Soft class-conditioned alignment
+    # ========================================================
+
+    def soft_class_conditioned_alignment(
+        self,
+        target_temporal_features,
+        target_probabilities,
+        use_semantics=True,
+        k=None,
+        return_details=False,
+    ):
+        """
+        Combine independently constructed class-specific
+        temporal alignments using EMA target probabilities.
+
+        For target sample b:
+
+            L_align(b)
+                =
+                sum_c p_b(c) * l_c(b)
+
+        IMPORTANT
+        ---------
+        Each class receives its own independent DP before
+        class probabilities are applied.
+
+        Target probabilities are treated as detached task
+        evidence; no gradient is propagated into the EMA
+        teacher.
+        """
+
+        self._require_configured()
+        self._require_reference_pool()
+
+        if target_temporal_features.ndim != 3:
+            raise ValueError(
+                "target_temporal_features must have "
+                "shape [B,D,L]."
+            )
+
+        if target_probabilities.ndim != 2:
+            raise ValueError(
+                "target_probabilities must have "
+                "shape [B,C]."
+            )
+
+        batch_size = int(
+            target_temporal_features.shape[0]
+        )
+
+        num_classes = int(
+            self.configs.num_classes
+        )
+
+        if target_probabilities.shape != (
+            batch_size,
+            num_classes,
+        ):
+            raise ValueError(
+                "Target probability shape mismatch: "
+                f"expected {(batch_size, num_classes)}, "
+                f"got {tuple(target_probabilities.shape)}."
+            )
+
+        # ----------------------------------------------------
+        # EMA probabilities are evidence only.
+        # ----------------------------------------------------
+
+        probabilities = (
+            target_probabilities
+            .detach()
+        )
+
+        if not torch.isfinite(
+            probabilities
+        ).all():
+            raise RuntimeError(
+                "Non-finite target probabilities."
+            )
+
+        probability_sums = (
+            probabilities.sum(
+                dim=1
+            )
+        )
+
+        if not torch.allclose(
+            probability_sums,
+            torch.ones_like(
+                probability_sums
+            ),
+            atol=1e-5,
+            rtol=1e-5,
+        ):
+            raise RuntimeError(
+                "Target class probabilities must "
+                "sum to one."
+            )
+
+        # ----------------------------------------------------
+        # Construct l_c(x_t) independently for every class.
+        # ----------------------------------------------------
+
+        class_losses = []
+        class_details = []
+
+        for class_id in range(
+            num_classes
+        ):
+
+            details = (
+                self.class_alignment_loss(
+                    target_temporal_features=
+                        target_temporal_features,
+
+                    class_id=
+                        class_id,
+
+                    use_semantics=
+                        use_semantics,
+
+                    k=
+                        k,
+
+                    return_details=True,
+                )
+            )
+
+            class_losses.append(
+                details[
+                    "per_target_loss"
+                ]
+            )
+
+            if return_details:
+                class_details.append(
+                    details
+                )
+
+        # [C tensors of B] -> [B,C]
+        class_loss_matrix = torch.stack(
+            class_losses,
+            dim=1,
+        )
+
+        # ----------------------------------------------------
+        # Class probabilities are applied AFTER all DPs.
+        # ----------------------------------------------------
+
+        weighted_per_target = (
+            probabilities
+            *
+            class_loss_matrix
+        ).sum(
+            dim=1
+        )
+
+        alignment_loss = (
+            weighted_per_target.mean()
+        )
+
+        if not return_details:
+            return alignment_loss
+
+        return {
+            "loss":
+                alignment_loss,
+
+            "per_target_loss":
+                weighted_per_target,
+
+            "class_loss_matrix":
+                class_loss_matrix,
+
+            "target_probabilities":
+                probabilities,
+
+            "class_details":
+                class_details,
+        }
+
+
+    # ========================================================
     # Training mode
     # ========================================================
 
