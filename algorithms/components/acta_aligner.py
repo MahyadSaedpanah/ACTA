@@ -18,6 +18,8 @@ The convention exactly matches semantic_preparation/dtw_utils.py.
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 SEM_START = 0
@@ -373,3 +375,603 @@ def transition_aware_soft_dp(
     )
 
     return terminal, table
+
+
+# ============================================================
+# TEMPORAL FEATURE RESAMPLING
+# ============================================================
+
+def resample_temporal_features(
+    features,
+    output_length,
+):
+    """
+    Resample temporal feature maps to ACTA's semantic grid.
+
+    Input:
+        [B, D, L]
+
+    Output:
+        [B, D, G]
+
+    align_corners=True preserves the normalized temporal
+    endpoints 0 and 1 used by ACTA's semantic geometry.
+    """
+
+    if features.ndim != 3:
+        raise ValueError(
+            "features must have shape [B, D, L]."
+        )
+
+    output_length = int(
+        output_length
+    )
+
+    if output_length <= 0:
+        raise ValueError(
+            "output_length must be positive."
+        )
+
+    if features.shape[-1] == output_length:
+        return features
+
+    return F.interpolate(
+        features,
+        size=output_length,
+        mode="linear",
+        align_corners=True,
+    )
+
+
+# ============================================================
+# FEATURE COST
+# ============================================================
+
+def cosine_feature_cost(
+    source_features,
+    target_features,
+    eps=1e-8,
+):
+    """
+    Pairwise temporal cosine distance:
+
+        d_ij = 1 - cos(h_i^s, h_j^t)
+
+    Inputs:
+        source_features [B, D, Ls]
+        target_features [B, D, Lt]
+
+    Returns:
+        [B, Ls, Lt]
+    """
+
+    if (
+        source_features.ndim != 3
+        or
+        target_features.ndim != 3
+    ):
+        raise ValueError(
+            "source_features and target_features "
+            "must have shape [B,D,L]."
+        )
+
+    if (
+        source_features.shape[0]
+        != target_features.shape[0]
+    ):
+        raise ValueError(
+            "Source and target batch sizes must match."
+        )
+
+    if (
+        source_features.shape[1]
+        != target_features.shape[1]
+    ):
+        raise ValueError(
+            "Source and target feature dimensions "
+            "must match."
+        )
+
+    source = F.normalize(
+        source_features.transpose(
+            1,
+            2,
+        ),
+        p=2,
+        dim=-1,
+        eps=eps,
+    )
+
+    target = F.normalize(
+        target_features.transpose(
+            1,
+            2,
+        ),
+        p=2,
+        dim=-1,
+        eps=eps,
+    )
+
+    similarity = torch.bmm(
+        source,
+        target.transpose(
+            1,
+            2,
+        ),
+    )
+
+    # Numerical roundoff can occasionally make cosine
+    # similarity microscopically larger than one.
+    cost = (
+        1.0 - similarity
+    ).clamp_min(
+        0.0
+    )
+
+    return cost
+
+
+def scale_feature_cost(
+    feature_cost,
+    eps=1e-6,
+):
+    """
+    Positive scale-only normalization.
+
+        d_tilde =
+            d /
+            stopgrad(mean(d))
+
+    This preserves the feature-only path ordering.
+
+    Returns
+    -------
+    scaled_cost
+    detached_scale
+    """
+
+    if feature_cost.ndim < 2:
+        raise ValueError(
+            "feature_cost must contain "
+            "two temporal dimensions."
+        )
+
+    scale = (
+        feature_cost
+        .detach()
+        .mean(
+            dim=(-2, -1),
+            keepdim=True,
+        )
+        .clamp_min(eps)
+    )
+
+    scaled = (
+        feature_cost
+        /
+        scale
+    )
+
+    return (
+        scaled,
+        scale,
+    )
+
+
+# ============================================================
+# DETACHED SOFT PATH EXTRACTION
+# ============================================================
+
+def extract_soft_alignment(
+    scaled_feature_cost,
+    semantic_bonus=None,
+    gamma=0.1,
+):
+    """
+    Select the soft temporal path using a detached feature
+    cost.
+
+    Path construction therefore does not backpropagate
+    second-order derivatives through the DP.
+
+    The returned soft alignment matrix is detached.
+
+        A = d D_soft / d C_path
+    """
+
+    with torch.enable_grad():
+
+        path_cost = (
+            scaled_feature_cost
+            .detach()
+            .requires_grad_(
+                True
+            )
+        )
+
+        if semantic_bonus is not None:
+
+            semantic_bonus = (
+                semantic_bonus
+                .detach()
+            )
+
+        terminal = (
+            transition_aware_soft_dp(
+                feature_cost=
+                    path_cost,
+
+                semantic_bonus=
+                    semantic_bonus,
+
+                gamma=
+                    gamma,
+            )
+        )
+
+        alignment = torch.autograd.grad(
+            terminal.sum(),
+            path_cost,
+            create_graph=False,
+            retain_graph=False,
+        )[0]
+
+    # --------------------------------------------------------
+    # Numerical occupancy stabilization
+    #
+    # Mathematically, dD/dC is a soft path occupancy:
+    #
+    #     0 <= A_ij <= 1
+    #
+    # Float32 autograd through a long soft-DP recurrence can
+    # produce tiny violations such as 1.00004.
+    #
+    # First reject any LARGE violation so that clamping cannot
+    # hide a real implementation bug, then enforce the exact
+    # mathematical range.
+    # --------------------------------------------------------
+
+    alignment = alignment.detach()
+
+    numerical_tolerance = 1e-3
+
+    if (
+        alignment.min().item()
+        < -numerical_tolerance
+        or
+        alignment.max().item()
+        >
+        1.0 + numerical_tolerance
+    ):
+        raise RuntimeError(
+            "Soft alignment occupancy is outside "
+            "the expected numerical range. "
+            f"min={alignment.min().item()}, "
+            f"max={alignment.max().item()}."
+        )
+
+    alignment = alignment.clamp(
+        min=0.0,
+        max=1.0,
+    )
+
+    return (
+        alignment,
+        terminal.detach(),
+    )
+
+
+# ============================================================
+# ACTA PAIR ALIGNMENT CORE
+# ============================================================
+
+class ACTAAlignmentCore(nn.Module):
+    """
+    Pair-level alignment primitive shared by UTA and ACTA.
+
+    UTA:
+        use_semantics=False
+
+    ACTA:
+        use_semantics=True
+
+    When lambda_sem == 0, ACTA becomes feature-only UTA.
+    """
+
+    def __init__(
+        self,
+        semantic_bank,
+        gamma=0.1,
+        lambda_sem=1.0,
+        eps=1e-6,
+        detach_source=True,
+    ):
+        super().__init__()
+
+        self.semantic_bank = (
+            semantic_bank
+        )
+
+        self.gamma = float(
+            gamma
+        )
+
+        self.lambda_sem = float(
+            lambda_sem
+        )
+
+        self.eps = float(
+            eps
+        )
+
+        self.detach_source = bool(
+            detach_source
+        )
+
+
+    def forward(
+        self,
+        source_features,
+        target_features,
+        class_id=None,
+        use_semantics=True,
+        return_details=False,
+    ):
+        """
+        Parameters
+        ----------
+        source_features:
+            [B, D, Ls]
+
+        target_features:
+            [B, D, Lt]
+
+        class_id:
+            Semantic class shared by this pair batch.
+
+        use_semantics:
+            False -> UTA
+            True  -> ACTA
+
+        Returns
+        -------
+        scalar alignment loss
+
+        or diagnostics dict if return_details=True.
+        """
+
+        if (
+            source_features.ndim != 3
+            or
+            target_features.ndim != 3
+        ):
+            raise ValueError(
+                "Expected feature maps [B,D,L]."
+            )
+
+        if (
+            source_features.shape[0]
+            != target_features.shape[0]
+        ):
+            raise ValueError(
+                "Source/target pair batch mismatch."
+            )
+
+        if (
+            source_features.shape[1]
+            != target_features.shape[1]
+        ):
+            raise ValueError(
+                "Source/target feature dimension mismatch."
+            )
+
+        batch_size = int(
+            source_features.shape[0]
+        )
+
+        # ----------------------------------------------------
+        # Alignment branch should not pull source-reference
+        # features away from the supervised source geometry.
+        #
+        # Source CE will still update the shared encoder in
+        # the full ACTA algorithm.
+        # ----------------------------------------------------
+
+        if self.detach_source:
+
+            source_for_alignment = (
+                source_features.detach()
+            )
+
+        else:
+
+            source_for_alignment = (
+                source_features
+            )
+
+        # ----------------------------------------------------
+        # Semantic deployment resolution comes from package.
+        # No dataset-specific hard-code.
+        # ----------------------------------------------------
+
+        semantic_length = int(
+            self.semantic_bank
+            .semantic_temporal_length
+        )
+
+        source_grid = (
+            resample_temporal_features(
+                source_for_alignment,
+                semantic_length,
+            )
+        )
+
+        target_grid = (
+            resample_temporal_features(
+                target_features,
+                semantic_length,
+            )
+        )
+
+        # ----------------------------------------------------
+        # Feature geometry
+        # ----------------------------------------------------
+
+        feature_cost = (
+            cosine_feature_cost(
+                source_grid,
+                target_grid,
+            )
+        )
+
+        (
+            scaled_feature_cost,
+            feature_scale,
+        ) = scale_feature_cost(
+            feature_cost,
+            eps=self.eps,
+        )
+
+        # ----------------------------------------------------
+        # Semantic geometry
+        # ----------------------------------------------------
+
+        semantic = None
+
+        semantic_is_active = (
+            bool(use_semantics)
+            and
+            self.lambda_sem != 0.0
+        )
+
+        if semantic_is_active:
+
+            if class_id is None:
+                raise ValueError(
+                    "class_id is required when "
+                    "semantic alignment is active."
+                )
+
+            class_id = int(
+                class_id
+            )
+
+            semantic_single = (
+                self.semantic_bank
+                .semantic_bonus(
+                    class_id=
+                        class_id,
+
+                    source_length=
+                        semantic_length,
+
+                    target_length=
+                        semantic_length,
+
+                    lambda_sem=
+                        self.lambda_sem,
+
+                    device=
+                        feature_cost.device,
+
+                    dtype=
+                        feature_cost.dtype,
+                )
+            )
+
+            semantic = (
+                semantic_single
+                .unsqueeze(0)
+                .expand(
+                    batch_size,
+                    -1,
+                    -1,
+                    -1,
+                )
+            )
+
+        # ----------------------------------------------------
+        # Structured path selection
+        # ----------------------------------------------------
+
+        (
+            alignment,
+            terminal_cost,
+        ) = extract_soft_alignment(
+            scaled_feature_cost=
+                scaled_feature_cost,
+
+            semantic_bonus=
+                semantic,
+
+            gamma=
+                self.gamma,
+        )
+
+        # ----------------------------------------------------
+        # Representation loss
+        #
+        # IMPORTANT:
+        #
+        # Path is selected using scaled detached cost.
+        # Representation learning uses ORIGINAL,
+        # non-detached feature distance.
+        # ----------------------------------------------------
+
+        alignment_mass = (
+            alignment.sum(
+                dim=(-2, -1)
+            )
+            .clamp_min(
+                self.eps
+            )
+        )
+
+        pair_loss = (
+            (
+                alignment
+                *
+                feature_cost
+            )
+            .sum(
+                dim=(-2, -1)
+            )
+            /
+            alignment_mass
+        )
+
+        loss = (
+            pair_loss.mean()
+        )
+
+        if not return_details:
+            return loss
+
+        return {
+            "loss":
+                loss,
+
+            "pair_loss":
+                pair_loss,
+
+            "alignment":
+                alignment,
+
+            "feature_cost":
+                feature_cost,
+
+            "scaled_feature_cost":
+                scaled_feature_cost,
+
+            "feature_scale":
+                feature_scale,
+
+            "semantic_bonus":
+                semantic,
+
+            "terminal_cost":
+                terminal_cost,
+
+            "semantic_length":
+                semantic_length,
+        }
