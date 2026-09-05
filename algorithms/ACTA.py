@@ -47,6 +47,9 @@ from utils.module import (
     TemporalClassifierHead,
 )
 
+from algorithms.components.source_reference import (
+    ClassIndexedSourceReferencePool,
+)
 
 # ============================================================
 # ACTA
@@ -206,6 +209,27 @@ class ACTA(Algorithm):
         self.optimizer = None
 
         self.is_configured = False
+
+        # ----------------------------------------------------
+        # Class-indexed source references
+        # ----------------------------------------------------
+
+        self.reference_k = int(
+            getattr(
+                args,
+                "acta_k",
+                2,
+            )
+        )
+
+        if self.reference_k <= 0:
+            raise ValueError(
+                "acta_k must be positive."
+            )
+
+        self.reference_pool = None
+        self.reference_seed = None
+
 
 
     # ========================================================
@@ -574,6 +598,330 @@ class ACTA(Algorithm):
         self.semantic_bank.eval()
 
         return self
+
+
+    # ========================================================
+    # Source reference pool
+    # ========================================================
+
+    def attach_source_reference_pool(
+        self,
+        source_train_dataset,
+        reference_seed=None,
+    ):
+        """
+        Attach the normalized SOURCE TRAIN dataset used for
+        class-indexed ACTA references.
+
+        This dataset is separate from the regular source
+        minibatch stream used for source CE.
+
+        No target data is used.
+        """
+
+        self._require_configured()
+
+        if reference_seed is None:
+            reference_seed = int(
+                self.seed
+            )
+
+        reference_seed = int(
+            reference_seed
+        )
+
+        self.reference_pool = (
+            ClassIndexedSourceReferencePool(
+                dataset=
+                    source_train_dataset,
+
+                num_classes=
+                    self.configs.num_classes,
+
+                seed=
+                    reference_seed,
+            )
+        )
+
+        self.reference_seed = (
+            reference_seed
+        )
+
+        return self
+
+
+    def _require_reference_pool(
+        self,
+    ):
+
+        if self.reference_pool is None:
+            raise RuntimeError(
+                "ACTA source reference pool is not "
+                "attached. Call "
+                "attach_source_reference_pool() first."
+            )
+
+
+    def sample_class_references(
+        self,
+        class_id,
+        k=None,
+        return_indices=False,
+    ):
+        """
+        Sample K raw normalized source references
+        from source class c.
+        """
+
+        self._require_reference_pool()
+
+        if k is None:
+            k = self.reference_k
+
+        return self.reference_pool.sample(
+            class_id=int(class_id),
+            k=int(k),
+            device=self.device_runtime,
+            return_indices=return_indices,
+        )
+
+
+    # ========================================================
+    # Per-class multi-reference alignment
+    # ========================================================
+
+    def class_alignment_loss(
+        self,
+        target_temporal_features,
+        class_id,
+        use_semantics=True,
+        k=None,
+        return_details=False,
+    ):
+        """
+        Compute ACTA/UTA alignment loss for ONE semantic class.
+
+        Parameters
+        ----------
+        target_temporal_features:
+            [B, D, L]
+
+            Student target temporal feature map.
+
+        class_id:
+            Task / semantic class c.
+
+        use_semantics:
+            False -> UTA
+            True  -> ACTA
+
+        k:
+            Number of same-class source references.
+
+        Returns
+        -------
+        per_target_loss:
+            [B]
+
+            l_c(x_t) averaged over K references.
+        """
+
+        self._require_configured()
+        self._require_reference_pool()
+
+        class_id = int(
+            class_id
+        )
+
+        if k is None:
+            k = self.reference_k
+
+        k = int(
+            k
+        )
+
+        if target_temporal_features.ndim != 3:
+            raise ValueError(
+                "target_temporal_features must have "
+                "shape [B,D,L]."
+            )
+
+        batch_size = int(
+            target_temporal_features.shape[0]
+        )
+
+        # ----------------------------------------------------
+        # Sample K same-class source references
+        # ----------------------------------------------------
+
+        (
+            reference_x,
+            reference_y,
+            reference_indices,
+        ) = self.sample_class_references(
+            class_id=class_id,
+            k=k,
+            return_indices=True,
+        )
+
+        if not torch.all(
+            reference_y
+            ==
+            class_id
+        ):
+            raise RuntimeError(
+                "Wrong-class source reference."
+            )
+
+        # ----------------------------------------------------
+        # Source-reference feature extraction
+        #
+        # Stop-gradient by design.
+        #
+        # The shared encoder itself is still updated through
+        # source CE in the full ACTA update.
+        # ----------------------------------------------------
+
+        with torch.no_grad():
+
+            reference_features = (
+                self.feature_extractor
+                .forward_features(
+                    reference_x
+                )
+            )
+
+        # reference_features:
+        #     [K, D, L]
+        #
+        # target_temporal_features:
+        #     [B, D, L]
+        #
+        # Build all B x K matched pairs.
+        # ----------------------------------------------------
+
+        _, feature_dim, temporal_length = (
+            reference_features.shape
+        )
+
+        if (
+            target_temporal_features.shape[1]
+            != feature_dim
+        ):
+            raise RuntimeError(
+                "Reference/target feature dimension "
+                "mismatch."
+            )
+
+        # [B,K,D,L]
+        source_pairs = (
+            reference_features[
+                None,
+                :,
+                :,
+                :
+            ]
+            .expand(
+                batch_size,
+                k,
+                feature_dim,
+                temporal_length,
+            )
+            .reshape(
+                batch_size * k,
+                feature_dim,
+                temporal_length,
+            )
+        )
+
+        target_length = int(
+            target_temporal_features.shape[-1]
+        )
+
+        target_pairs = (
+            target_temporal_features[
+                :,
+                None,
+                :,
+                :
+            ]
+            .expand(
+                batch_size,
+                k,
+                feature_dim,
+                target_length,
+            )
+            .reshape(
+                batch_size * k,
+                feature_dim,
+                target_length,
+            )
+        )
+
+        # ----------------------------------------------------
+        # Shared ACTA/UTA alignment primitive
+        # ----------------------------------------------------
+
+        details = self.alignment_core(
+            source_features=
+                source_pairs,
+
+            target_features=
+                target_pairs,
+
+            class_id=
+                class_id,
+
+            use_semantics=
+                use_semantics,
+
+            return_details=True,
+        )
+
+        # [B*K] -> [B,K]
+        pair_loss_matrix = (
+            details[
+                "pair_loss"
+            ]
+            .reshape(
+                batch_size,
+                k,
+            )
+        )
+
+        # ----------------------------------------------------
+        # Average over references only.
+        #
+        # Do NOT average target samples here.
+        # We need one l_c(x_t) per target for later
+        # soft class conditioning.
+        # ----------------------------------------------------
+
+        per_target_loss = (
+            pair_loss_matrix.mean(
+                dim=1
+            )
+        )
+
+        if not return_details:
+            return per_target_loss
+
+        return {
+            "per_target_loss":
+                per_target_loss,
+
+            "pair_loss_matrix":
+                pair_loss_matrix,
+
+            "reference_indices":
+                reference_indices,
+
+            "reference_labels":
+                reference_y,
+
+            "alignment_details":
+                details,
+        }
 
 
     # ========================================================
