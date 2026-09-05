@@ -253,6 +253,22 @@ class FrozenSemanticBank(nn.Module):
             package["num_classes"]
         )
 
+        geometry = package[
+            "semantic_geometry"
+        ]
+
+        self.semantic_temporal_length = int(
+            geometry[
+                "semantic_temporal_length"
+            ]
+        )
+
+        self.semantic_channels = int(
+            geometry[
+                "semantic_channels"
+            ]
+        )
+
         self.models = nn.ModuleList()
 
         kappas = []

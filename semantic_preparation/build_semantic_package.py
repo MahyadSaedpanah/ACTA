@@ -752,6 +752,12 @@ def build_semantic_package(
             "dtw_downsample":
                 int(downsample),
 
+            "semantic_temporal_length":
+                int(cache[0].shape[0]),
+
+            "semantic_channels":
+                int(cache[0].shape[1]),
+
             "dtw_normalization":
                 "per-sample per-channel z-normalization",
 
