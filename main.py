@@ -38,6 +38,55 @@ parser.add_argument('--end', type=int, default=None)
 parser.add_argument('-p','--print-freq', type=int, default=10, help='each epoch print num_epochs/p times ')
 parser.add_argument('--num_workers', type=int, default=2)
 parser.add_argument('--shuffle', action='store_true', help='whether shuffle the train dataset')
+# ACTA
+parser.add_argument(
+    '--acta_mode',
+    type=str,
+    default='ACTA',
+    choices=['ACTA', 'UTA', 'ClassShuffle']
+)
+
+parser.add_argument(
+    '--acta_k',
+    type=int,
+    default=2
+)
+
+parser.add_argument(
+    '--acta_beta',
+    type=float,
+    default=1.0
+)
+
+parser.add_argument(
+    '--acta_lambda',
+    type=float,
+    default=1.0
+)
+
+parser.add_argument(
+    '--acta_gamma',
+    type=float,
+    default=0.1
+)
+
+parser.add_argument(
+    '--acta_ema',
+    type=float,
+    default=0.99
+)
+
+parser.add_argument(
+    '--source_model_root',
+    type=str,
+    default='source_models'
+)
+
+parser.add_argument(
+    '--semantic_root',
+    type=str,
+    default='semantic_packages'
+)
 parser.add_argument('--phase', default='train', type=str)
 parser.add_argument('--test_model_prefix', type=str)
 
