@@ -804,10 +804,12 @@ def transition_aware_soft_dp(
     """
     Public ACTA DP interface.
 
-    During optimization validation this remains routed to
-    the original reference implementation.
+    Uses the exact-equivalent vectorized anti-diagonal
+    implementation validated against the original reference
+    recurrence in terminal cost, full DP table, and
+    occupancy gradients.
     """
-    return _transition_aware_soft_dp_reference(
+    return _transition_aware_soft_dp_antidiagonal(
         feature_cost=feature_cost,
         semantic_bonus=semantic_bonus,
         gamma=gamma,
