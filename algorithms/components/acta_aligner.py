@@ -130,7 +130,7 @@ def _validate_inputs(
     return ls, lt
 
 
-def transition_aware_soft_dp(
+def _transition_aware_soft_dp_reference(
     feature_cost,
     semantic_bonus=None,
     gamma=0.1,
@@ -376,6 +376,443 @@ def transition_aware_soft_dp(
 
     return terminal, table
 
+def _transition_aware_soft_dp_antidiagonal(
+    feature_cost,
+    semantic_bonus=None,
+    gamma=0.1,
+    return_table=False,
+):
+    """
+    Vectorized anti-diagonal implementation of ACTA's
+    transition-aware soft dynamic program.
+
+    This implements exactly the same recurrence as
+    _transition_aware_soft_dp_reference, but computes all
+    cells on the same anti-diagonal in parallel.
+
+    Cells satisfying
+
+        i + j = k
+
+    are independent given anti-diagonals k-1 and k-2.
+
+    Therefore the number of sequential Python recurrence
+    steps is reduced from
+
+        Ls * Lt
+
+    to
+
+        Ls + Lt - 1.
+
+    No ACTA objective, transition rule, semantic term,
+    temperature, or boundary condition is changed.
+    """
+
+    ls, lt = _validate_inputs(
+        feature_cost,
+        semantic_bonus,
+    )
+
+    device = feature_cost.device
+
+    # Each entry stores one complete anti-diagonal:
+    #
+    #     [..., number_of_cells_on_diagonal]
+    #
+    diagonals = []
+
+    # Starting i-index associated with each anti-diagonal.
+    # This lets us map a grid coordinate i to its position
+    # inside the corresponding vectorized diagonal.
+    diagonal_i_starts = []
+
+    num_diagonals = ls + lt - 1
+
+    for k in range(num_diagonals):
+
+        # ----------------------------------------------------
+        # Valid cells satisfying:
+        #
+        #     i + j = k
+        #
+        # ----------------------------------------------------
+
+        i_start = max(
+            0,
+            k - (lt - 1),
+        )
+
+        i_end = min(
+            ls - 1,
+            k,
+        )
+
+        i_idx = torch.arange(
+            i_start,
+            i_end + 1,
+            device=device,
+            dtype=torch.long,
+        )
+
+        j_idx = k - i_idx
+
+        diagonal_i_starts.append(
+            i_start
+        )
+
+        # ----------------------------------------------------
+        # Local feature costs for the entire anti-diagonal.
+        #
+        # Shape:
+        #
+        #     [..., M]
+        #
+        # where M is the number of cells on this diagonal.
+        # ----------------------------------------------------
+
+        local = feature_cost[
+            ...,
+            i_idx,
+            j_idx,
+        ]
+
+        # ----------------------------------------------------
+        # START
+        # ----------------------------------------------------
+
+        if k == 0:
+
+            if semantic_bonus is None:
+
+                sem_start = 0.0
+
+            else:
+
+                sem_start = semantic_bonus[
+                    ...,
+                    0,
+                    0,
+                    SEM_START,
+                ]
+
+            current = (
+                local
+                -
+                sem_start.unsqueeze(-1)
+                if torch.is_tensor(sem_start)
+                else local - sem_start
+            )
+
+            diagonals.append(
+                current
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # Semantic contributions for current cells
+        # ----------------------------------------------------
+
+        if semantic_bonus is None:
+
+            sem_diagonal = 0.0
+            sem_vertical = 0.0
+            sem_horizontal = 0.0
+
+        else:
+
+            sem_diagonal = semantic_bonus[
+                ...,
+                i_idx,
+                j_idx,
+                SEM_DIAGONAL,
+            ]
+
+            sem_vertical = semantic_bonus[
+                ...,
+                i_idx,
+                j_idx,
+                SEM_VERTICAL,
+            ]
+
+            sem_horizontal = semantic_bonus[
+                ...,
+                i_idx,
+                j_idx,
+                SEM_HORIZONTAL,
+            ]
+
+        # ----------------------------------------------------
+        # Previous anti-diagonal k - 1
+        # ----------------------------------------------------
+
+        previous = diagonals[
+            k - 1
+        ]
+
+        previous_i_start = diagonal_i_starts[
+            k - 1
+        ]
+
+        previous_length = previous.shape[
+            -1
+        ]
+
+        # Horizontal predecessor:
+        #
+        #     (i, j - 1)
+        #
+        horizontal_pos = (
+            i_idx
+            -
+            previous_i_start
+        )
+
+        # Vertical predecessor:
+        #
+        #     (i - 1, j)
+        #
+        vertical_pos = (
+            i_idx
+            -
+            1
+            -
+            previous_i_start
+        )
+
+        # Boundary cells do not use all predecessor types.
+        # We clamp unused indices only so vectorized indexing
+        # remains valid. torch.where below ensures those
+        # branches do not contribute to the selected result.
+        horizontal_pos_safe = horizontal_pos.clamp(
+            0,
+            previous_length - 1,
+        )
+
+        vertical_pos_safe = vertical_pos.clamp(
+            0,
+            previous_length - 1,
+        )
+
+        horizontal_previous = previous[
+            ...,
+            horizontal_pos_safe,
+        ]
+
+        vertical_previous = previous[
+            ...,
+            vertical_pos_safe,
+        ]
+
+        horizontal_value = (
+            local
+            +
+            horizontal_previous
+            -
+            sem_horizontal
+        )
+
+        vertical_value = (
+            local
+            +
+            vertical_previous
+            -
+            sem_vertical
+        )
+
+        # ----------------------------------------------------
+        # Interior recurrence
+        # ----------------------------------------------------
+
+        if k >= 2:
+
+            two_back = diagonals[
+                k - 2
+            ]
+
+            two_back_i_start = diagonal_i_starts[
+                k - 2
+            ]
+
+            two_back_length = two_back.shape[
+                -1
+            ]
+
+            diagonal_pos = (
+                i_idx
+                -
+                1
+                -
+                two_back_i_start
+            )
+
+            diagonal_pos_safe = diagonal_pos.clamp(
+                0,
+                two_back_length - 1,
+            )
+
+            diagonal_previous = two_back[
+                ...,
+                diagonal_pos_safe,
+            ]
+
+            diagonal_candidate = (
+                diagonal_previous
+                -
+                sem_diagonal
+            )
+
+            vertical_candidate = (
+                vertical_previous
+                -
+                sem_vertical
+            )
+
+            horizontal_candidate = (
+                horizontal_previous
+                -
+                sem_horizontal
+            )
+
+            candidates = torch.stack(
+                [
+                    diagonal_candidate,
+                    vertical_candidate,
+                    horizontal_candidate,
+                ],
+                dim=-1,
+            )
+
+            interior_value = (
+                local
+                +
+                softmin(
+                    candidates,
+                    gamma,
+                )
+            )
+
+        else:
+
+            # k == 1 contains boundary cells only.
+            # Placeholder is never selected for an interior
+            # cell because no interior cell exists yet.
+            interior_value = local
+
+        # ----------------------------------------------------
+        # Select the correct recurrence for each cell.
+        #
+        # Top row:
+        #
+        #     i == 0
+        #
+        # Left column:
+        #
+        #     j == 0
+        #
+        # Everything else is interior.
+        # ----------------------------------------------------
+
+        is_top_row = (
+            i_idx == 0
+        )
+
+        is_left_column = (
+            j_idx == 0
+        )
+
+        current = torch.where(
+            is_top_row,
+            horizontal_value,
+            torch.where(
+                is_left_column,
+                vertical_value,
+                interior_value,
+            ),
+        )
+
+        diagonals.append(
+            current
+        )
+
+    # --------------------------------------------------------
+    # Final anti-diagonal always contains only (Ls-1, Lt-1).
+    # --------------------------------------------------------
+
+    terminal = diagonals[
+        -1
+    ][
+        ...,
+        0,
+    ]
+
+    if not return_table:
+        return terminal
+
+    # --------------------------------------------------------
+    # Reconstruct the conventional [..., Ls, Lt] table.
+    #
+    # This path is primarily for tests / diagnostics.
+    # Training only needs the terminal value.
+    # --------------------------------------------------------
+
+    rows = []
+
+    for i in range(ls):
+
+        row = []
+
+        for j in range(lt):
+
+            k = i + j
+
+            position = (
+                i
+                -
+                diagonal_i_starts[k]
+            )
+
+            row.append(
+                diagonals[k][
+                    ...,
+                    position,
+                ]
+            )
+
+        rows.append(
+            torch.stack(
+                row,
+                dim=-1,
+            )
+        )
+
+    table = torch.stack(
+        rows,
+        dim=-2,
+    )
+
+    return terminal, table
+
+
+def transition_aware_soft_dp(
+    feature_cost,
+    semantic_bonus=None,
+    gamma=0.1,
+    return_table=False,
+):
+    """
+    Public ACTA DP interface.
+
+    During optimization validation this remains routed to
+    the original reference implementation.
+    """
+    return _transition_aware_soft_dp_reference(
+        feature_cost=feature_cost,
+        semantic_bonus=semantic_bonus,
+        gamma=gamma,
+        return_table=return_table,
+    )
 
 # ============================================================
 # TEMPORAL FEATURE RESAMPLING
