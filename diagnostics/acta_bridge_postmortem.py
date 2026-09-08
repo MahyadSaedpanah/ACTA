@@ -44,6 +44,14 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 import torch
 from torch.utils.data import DataLoader
 
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from algorithms.ACTA import ACTA
 from algorithms.components.acta_aligner import (
     cosine_feature_cost,
