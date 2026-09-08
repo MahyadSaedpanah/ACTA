@@ -1,7 +1,19 @@
 """
-ACTA: Admissibility-Constrained Temporal Alignment
+ACTA-v2: Admissibility-Constrained Temporal Adaptation
 
-Stage-B algorithm skeleton.
+ACTA-v2 decouples two roles:
+
+    1. Adaptation drive:
+       Relative Feature Transport (RFT), using feature-only temporal paths.
+
+    2. Semantic preservation:
+       Temporal Admissibility Consistency (TAC), using source-only
+       class-conditioned temporal admissibility probes.
+
+Core principle:
+
+    Temporal Semantic Admissibility is used as a preservation certificate,
+    not as a source-target attraction direction.
 
 This file connects:
 
@@ -9,10 +21,8 @@ This file connects:
     source-only checkpoint theta_S
     EMA task teacher
     frozen source semantic package
-    ACTA transition-aware alignment core
-
-The actual multi-reference / class-conditioned update rule is added
-in later integration steps.
+    feature-only alignment core for RFT
+    frozen temporal admissibility probe bank for TAC
 
 IMPORTANT
 ---------
@@ -49,6 +59,11 @@ from utils.module import (
 
 from algorithms.components.source_reference import (
     ClassIndexedSourceReferencePool,
+)
+
+from algorithms.components.temporal_probe import (
+    TemporalProbeBank,
+    temporal_admissibility_consistency_loss,
 )
 
 # ============================================================
@@ -138,6 +153,14 @@ class ACTA(Algorithm):
             )
         )
 
+        self.eta = float(
+            getattr(
+                args,
+                "acta_eta",
+                1.0,
+            )
+        )
+
         self.lambda_sem = float(
             getattr(
                 args,
@@ -182,6 +205,9 @@ class ACTA(Algorithm):
 
         valid_modes = {
             "ACTA",
+            "RFT",
+            "UNIFORM",
+            "LEGACYACTA",
             "UTA",
             "CLASSSHUFFLE",
         }
@@ -189,7 +215,7 @@ class ACTA(Algorithm):
         if self.acta_mode not in valid_modes:
             raise ValueError(
                 "acta_mode must be one of "
-                "{ACTA, UTA, ClassShuffle}."
+                "{ACTA, RFT, Uniform, LegacyACTA, UTA, ClassShuffle}."
             )
 
         self.class_shuffle_map = None
@@ -224,8 +250,10 @@ class ACTA(Algorithm):
 
         self.source_checkpoint_path = None
         self.semantic_package_path = None
+        self.temporal_probe_codebook_path = None
 
         self.semantic_bank = None
+        self.temporal_probe_bank = None
         self.alignment_core = None
 
         self.optimizer = None
@@ -429,6 +457,16 @@ class ACTA(Algorithm):
             "semantic_package.pt"
         )
 
+        temporal_probe_codebook_path = (
+            Path(semantic_root)
+            /
+            dataset_name
+            /
+            f"source_{source_id}"
+            /
+            "temporal_probe_codebook.pt"
+        )
+
         if not source_checkpoint_path.exists():
             raise FileNotFoundError(
                 "Missing ACTA source checkpoint: "
@@ -439,6 +477,22 @@ class ACTA(Algorithm):
             raise FileNotFoundError(
                 "Missing ACTA semantic package: "
                 f"{semantic_package_path}"
+            )
+
+        requires_probe_bank = (
+            self.acta_mode
+            in
+            {"ACTA", "UNIFORM"}
+        )
+
+        if (
+            requires_probe_bank
+            and
+            not temporal_probe_codebook_path.exists()
+        ):
+            raise FileNotFoundError(
+                "Missing ACTA-v2 temporal probe codebook: "
+                f"{temporal_probe_codebook_path}"
             )
 
         # ----------------------------------------------------
@@ -578,6 +632,46 @@ class ACTA(Algorithm):
         )
 
         # ----------------------------------------------------
+        # ACTA-v2 source-only temporal admissibility codebook
+        #
+        # TSA no longer determines source-target attraction
+        # paths in the v2 objective. Instead it certifies
+        # which temporal counterfactuals should preserve the
+        # target prediction.
+        # ----------------------------------------------------
+
+        self.temporal_probe_bank = None
+
+        if temporal_probe_codebook_path.exists():
+
+            probe_bank = TemporalProbeBank(
+                temporal_probe_codebook_path
+            )
+
+            if probe_bank.dataset != dataset_name:
+                raise RuntimeError(
+                    "Temporal probe codebook dataset mismatch."
+                )
+
+            if probe_bank.source_domain != source_id:
+                raise RuntimeError(
+                    "Temporal probe codebook source mismatch."
+                )
+
+            if probe_bank.num_classes != self.configs.num_classes:
+                raise RuntimeError(
+                    "Temporal probe codebook class-count mismatch."
+                )
+
+            probe_bank.to(
+                self.device_runtime
+            )
+
+            probe_bank.eval()
+
+            self.temporal_probe_bank = probe_bank
+
+        # ----------------------------------------------------
         # Fresh Stage-B optimizer.
         #
         # IMPORTANT:
@@ -612,6 +706,12 @@ class ACTA(Algorithm):
             semantic_package_path
         )
 
+        self.temporal_probe_codebook_path = (
+            str(temporal_probe_codebook_path)
+            if temporal_probe_codebook_path.exists()
+            else None
+        )
+
         if (
             self.acta_mode
             ==
@@ -625,6 +725,9 @@ class ACTA(Algorithm):
         # whenever train() is called later.
         self._freeze_ema()
         self.semantic_bank.eval()
+
+        if self.temporal_probe_bank is not None:
+            self.temporal_probe_bank.eval()
 
         return self
 
@@ -715,7 +818,11 @@ class ACTA(Algorithm):
             class_id
         )
 
-        if self.acta_mode == "UTA":
+        if self.acta_mode in {
+            "UTA",
+            "RFT",
+            "UNIFORM",
+        }:
 
             return (
                 False,
@@ -723,7 +830,10 @@ class ACTA(Algorithm):
                 class_id,
             )
 
-        if self.acta_mode == "ACTA":
+        if self.acta_mode in {
+            "ACTA",
+            "LEGACYACTA",
+        }:
 
             return (
                 True,
@@ -1294,6 +1404,269 @@ class ACTA(Algorithm):
 
 
     # ========================================================
+    # ACTA-v2 Relative Feature Transport (RFT)
+    # ========================================================
+
+    def relative_feature_transport(
+        self,
+        target_temporal_features,
+        target_probabilities,
+        k=None,
+        return_details=False,
+    ):
+        """
+        Feature-only discriminative transport.
+
+        For target sample b and class-specific feature-only
+        transport costs l_c(b):
+
+            L_RFT(b)
+              =
+              sum_c p_c l_c
+              -
+              sum_c p_c [mean_{k != c} l_k]
+
+        EMA probabilities are detached.
+
+        Important: TSA semantic bonus is deliberately NOT used
+        here. ACTA-v2 decouples adaptation drive (RFT) from
+        temporal semantic preservation (TAC).
+        """
+
+        self._require_configured()
+        self._require_reference_pool()
+
+        if k is None:
+            k = self.reference_k
+
+        probabilities = target_probabilities.detach()
+
+        if probabilities.ndim != 2:
+            raise ValueError(
+                "target_probabilities must have shape [B,C]."
+            )
+
+        num_classes = int(
+            self.configs.num_classes
+        )
+
+        if num_classes < 2:
+            raise RuntimeError(
+                "RFT requires at least two classes."
+            )
+
+        class_losses = []
+
+        for class_id in range(num_classes):
+
+            per_target = self.class_alignment_loss(
+                target_temporal_features=
+                    target_temporal_features,
+
+                class_id=
+                    class_id,
+
+                # Feature-only path by design.
+                use_semantics=
+                    False,
+
+                k=
+                    k,
+
+                return_details=
+                    False,
+            )
+
+            class_losses.append(
+                per_target
+            )
+
+        class_loss_matrix = torch.stack(
+            class_losses,
+            dim=1,
+        )
+
+        if probabilities.shape != class_loss_matrix.shape:
+            raise ValueError(
+                "EMA probability/class transport shape mismatch."
+            )
+
+        weighted_positive = (
+            probabilities
+            *
+            class_loss_matrix
+        ).sum(
+            dim=1
+        )
+
+        # For each hypothetical class c, compare l_c with the
+        # mean transport cost to all competing classes.
+        total_class_cost = class_loss_matrix.sum(
+            dim=1,
+            keepdim=True,
+        )
+
+        competing_mean_matrix = (
+            total_class_cost
+            -
+            class_loss_matrix
+        ) / float(
+            num_classes - 1
+        )
+
+        weighted_competing = (
+            probabilities
+            *
+            competing_mean_matrix
+        ).sum(
+            dim=1
+        )
+
+        relative_per_target = (
+            weighted_positive
+            -
+            weighted_competing
+        )
+
+        loss = relative_per_target.mean()
+
+        if not return_details:
+            return loss
+
+        return {
+            "loss":
+                loss,
+
+            "per_target_loss":
+                relative_per_target,
+
+            "class_loss_matrix":
+                class_loss_matrix,
+
+            "weighted_positive":
+                weighted_positive,
+
+            "weighted_competing":
+                weighted_competing,
+
+            "target_probabilities":
+                probabilities,
+        }
+
+
+    # ========================================================
+    # ACTA-v2 Temporal Admissibility Consistency (TAC)
+    # ========================================================
+
+    def temporal_admissibility_consistency(
+        self,
+        target_x,
+        target_probabilities,
+        uniform_weights=False,
+        return_details=False,
+    ):
+        """
+        Apply all source-only temporal probes to target inputs
+        and enforce prediction preservation.
+
+        ACTA:
+            semantic codebook weights w_bm
+
+        UNIFORM ablation:
+            replace each sample's semantic profile by its mean
+            weight across probes. This exactly preserves the
+            total consistency pressure while removing WHICH
+            temporal transformations TSA prefers.
+        """
+
+        if self.temporal_probe_bank is None:
+            raise RuntimeError(
+                "Temporal probe bank is required for TAC."
+            )
+
+        batch_size = int(
+            target_x.shape[0]
+        )
+
+        probe_weights = (
+            self.temporal_probe_bank
+            .expected_probe_weights(
+                target_probabilities
+            )
+        )
+
+        if uniform_weights:
+
+            mean_weight = probe_weights.mean(
+                dim=1,
+                keepdim=True,
+            )
+
+            probe_weights = mean_weight.expand_as(
+                probe_weights
+            )
+
+        warped = self.temporal_probe_bank.warp_all(
+            target_x
+        )
+
+        flat_warped = (
+            self.temporal_probe_bank
+            .flatten_warped(
+                warped
+            )
+        )
+
+        probe_features = self.feature_extractor(
+            flat_warped
+        )
+
+        flat_probe_logits = self.classifier(
+            probe_features
+        )
+
+        probe_logits = (
+            self.temporal_probe_bank
+            .unflatten_probe_logits(
+                flat_probe_logits,
+                batch_size=batch_size,
+            )
+        )
+
+        loss, details = (
+            temporal_admissibility_consistency_loss(
+                reference_probabilities=
+                    target_probabilities,
+
+                probe_logits=
+                    probe_logits,
+
+                probe_weights=
+                    probe_weights,
+            )
+        )
+
+        if not return_details:
+            return loss
+
+        details = dict(
+            details
+        )
+
+        details[
+            "loss"
+        ] = loss
+
+        details[
+            "uniform_weights"
+        ] = bool(
+            uniform_weights
+        )
+
+        return details
+
+
+    # ========================================================
     # Training mode
     # ========================================================
 
@@ -1330,6 +1703,9 @@ class ACTA(Algorithm):
 
         if self.semantic_bank is not None:
             self.semantic_bank.eval()
+
+        if self.temporal_probe_bank is not None:
+            self.temporal_probe_bank.eval()
 
         return self
 
@@ -1479,54 +1855,32 @@ class ACTA(Algorithm):
         """
         Perform one Stage-B adaptation step.
 
-        Objective:
+        ACTA-v2 objective:
 
             L_total
-                =
-                L_source
-                +
-                beta * L_align
+              =
+              L_source
+              + beta * L_RFT
+              + eta  * L_TAC
 
-        where L_align is the EMA-weighted combination of
-        independently constructed class-specific alignments.
+        where:
 
-        Parameters
-        ----------
-        src_x:
-            Labeled source minibatch.
+            RFT = feature-only relative/discriminative transport
+            TAC = TSA-conditioned temporal preservation
 
-        src_y:
-            Source labels.
+        Modes:
+            ACTA       : RFT + semantic TAC
+            RFT        : RFT only
+            UNIFORM    : RFT + matched-strength uniform TAC
 
-        trg_x:
-            Unlabeled target minibatch.
+        Legacy modes remain available only for reproducibility:
+            LEGACYACTA, UTA, CLASSSHUFFLE
 
-        use_semantics:
-            True  -> ACTA
-            False -> feature-only UTA
-
-        Notes
-        -----
-        Target labels are never accepted by this method.
-
-        EMA probabilities are detached evidence only.
-
-        Source reference features used by the alignment branch
-        are stop-gradient.
-
-        BatchNorm running statistics remain frozen.
+        Target labels are never accepted.
         """
 
         self._require_configured()
         self._require_reference_pool()
-
-        # ----------------------------------------------------
-        # Defensive adaptation-mode enforcement.
-        #
-        # Trainer calls algorithm.train(), but we enforce BN
-        # freezing here as well so a future trainer change
-        # cannot silently reintroduce BN contamination.
-        # ----------------------------------------------------
 
         self.feature_extractor.train()
         self.classifier.train()
@@ -1539,51 +1893,104 @@ class ACTA(Algorithm):
         self.ema_classifier.eval()
         self.semantic_bank.eval()
 
-        # ----------------------------------------------------
-        # Fresh optimization step
-        # ----------------------------------------------------
+        if self.temporal_probe_bank is not None:
+            self.temporal_probe_bank.eval()
 
         self.optimizer.zero_grad(
             set_to_none=True
         )
 
         # ----------------------------------------------------
-        # 1. Supervised SOURCE objective
+        # 1. Supervised source task preservation
         # ----------------------------------------------------
 
-        source_features = (
-            self.feature_extractor(
-                src_x
-            )
+        source_features = self.feature_extractor(
+            src_x
         )
 
-        source_logits = (
-            self.classifier(
-                source_features
-            )
+        source_logits = self.classifier(
+            source_features
         )
 
-        source_loss = (
-            self.cross_entropy(
-                source_logits,
-                src_y,
-            )
+        source_loss = self.cross_entropy(
+            source_logits,
+            src_y,
         )
 
         # ----------------------------------------------------
-        # 2. EMA target task evidence
-        #
-        # No target labels.
+        # 2. Detached EMA target task evidence
         # ----------------------------------------------------
 
-        target_probabilities = (
-            self.ema_probabilities(
-                trg_x
-            )
+        target_probabilities = self.ema_probabilities(
+            trg_x
         )
 
         # ----------------------------------------------------
-        # 3. Student target temporal representation
+        # Legacy-v1 reproduction branch
+        # ----------------------------------------------------
+
+        if self.acta_mode in {
+            "LEGACYACTA",
+            "UTA",
+            "CLASSSHUFFLE",
+        }:
+
+            target_temporal_features = (
+                self.feature_extractor
+                .forward_features(
+                    trg_x
+                )
+            )
+
+            alignment_loss = (
+                self.soft_class_conditioned_alignment(
+                    target_temporal_features=
+                        target_temporal_features,
+
+                    target_probabilities=
+                        target_probabilities,
+
+                    use_semantics=
+                        None,
+
+                    k=
+                        self.reference_k,
+
+                    return_details=
+                        False,
+                )
+            )
+
+            total_loss = (
+                source_loss
+                +
+                self.beta
+                *
+                alignment_loss
+            )
+
+            if not torch.isfinite(total_loss):
+                raise RuntimeError(
+                    "Non-finite legacy ACTA total loss."
+                )
+
+            total_loss.backward()
+            self.optimizer.step()
+            self.update_ema()
+
+            return {
+                "Total_loss":
+                    float(total_loss.detach().item()),
+
+                "Source_loss":
+                    float(source_loss.detach().item()),
+
+                "Alignment_loss":
+                    float(alignment_loss.detach().item()),
+            }
+
+        # ----------------------------------------------------
+        # ACTA-v2: adaptation drive = RFT
         # ----------------------------------------------------
 
         target_temporal_features = (
@@ -1593,85 +2000,99 @@ class ACTA(Algorithm):
             )
         )
 
-        # ----------------------------------------------------
-        # 4. Class-specific temporal alignment
-        # ----------------------------------------------------
+        rft_loss = self.relative_feature_transport(
+            target_temporal_features=
+                target_temporal_features,
 
-        alignment_loss = (
-            self.soft_class_conditioned_alignment(
-                target_temporal_features=
-                    target_temporal_features,
+            target_probabilities=
+                target_probabilities,
 
-                target_probabilities=
-                    target_probabilities,
+            k=
+                self.reference_k,
 
-                use_semantics=None,
-
-                k=
-                    self.reference_k,
-
-                return_details=False,
-            )
+            return_details=
+                False,
         )
 
         # ----------------------------------------------------
-        # 5. Final ACTA objective
+        # ACTA-v2: semantic preservation = TAC
         # ----------------------------------------------------
+
+        tac_loss = torch.zeros(
+            (),
+            device=source_loss.device,
+            dtype=source_loss.dtype,
+        )
+
+        mean_probe_weight = torch.zeros_like(
+            tac_loss
+        )
+
+        if self.acta_mode in {
+            "ACTA",
+            "UNIFORM",
+        }:
+
+            tac_details = (
+                self.temporal_admissibility_consistency(
+                    target_x=
+                        trg_x,
+
+                    target_probabilities=
+                        target_probabilities,
+
+                    uniform_weights=
+                        (self.acta_mode == "UNIFORM"),
+
+                    return_details=
+                        True,
+                )
+            )
+
+            tac_loss = tac_details[
+                "loss"
+            ]
+
+            mean_probe_weight = tac_details[
+                "mean_probe_weight"
+            ]
 
         total_loss = (
             source_loss
             +
             self.beta
             *
-            alignment_loss
+            rft_loss
+            +
+            self.eta
+            *
+            tac_loss
         )
 
-        if not torch.isfinite(
-            total_loss
-        ):
+        if not torch.isfinite(total_loss):
             raise RuntimeError(
-                "Non-finite ACTA total loss."
+                "Non-finite ACTA-v2 total loss."
             )
 
-        # ----------------------------------------------------
-        # 6. Student update
-        # ----------------------------------------------------
-
         total_loss.backward()
-
         self.optimizer.step()
-
-        # ----------------------------------------------------
-        # 7. EMA follows updated student
-        # ----------------------------------------------------
-
         self.update_ema()
-
-        # ----------------------------------------------------
-        # Return plain scalars for existing Trainer meters.
-        # ----------------------------------------------------
 
         return {
             "Total_loss":
-                float(
-                    total_loss
-                    .detach()
-                    .item()
-                ),
+                float(total_loss.detach().item()),
 
             "Source_loss":
-                float(
-                    source_loss
-                    .detach()
-                    .item()
-                ),
+                float(source_loss.detach().item()),
 
-            "Alignment_loss":
-                float(
-                    alignment_loss
-                    .detach()
-                    .item()
-                ),
+            "RFT_loss":
+                float(rft_loss.detach().item()),
+
+            "TAC_loss":
+                float(tac_loss.detach().item()),
+
+            "Mean_probe_weight":
+                float(mean_probe_weight.detach().item()),
         }
 
     # ========================================================
@@ -1696,7 +2117,7 @@ class ACTA(Algorithm):
 
         checkpoint = {
             "format":
-                "ACTA_ADAPTATION_V1",
+                "ACTA_ADAPTATION_V2",
 
             "context": {
                 "dataset":
@@ -1777,13 +2198,12 @@ class ACTA(Algorithm):
             weights_only=False,
         )
 
-        if (
-            checkpoint.get(
-                "format"
-            )
-            !=
-            "ACTA_ADAPTATION_V1"
-        ):
+        if checkpoint.get(
+            "format"
+        ) not in {
+            "ACTA_ADAPTATION_V1",
+            "ACTA_ADAPTATION_V2",
+        }:
             raise RuntimeError(
                 "Unsupported ACTA checkpoint format."
             )
