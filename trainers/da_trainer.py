@@ -18,10 +18,8 @@ from algorithms import get_algorithm_class
 from algorithms.utils import get_time
 from algorithms.utils import AverageMeter
 from sklearn.metrics import f1_score
-from utils.plot import plot_losses, plot_metrics
 
 torch.backends.cudnn.benchmark = True  
-warnings.filterwarnings('ignore', category=np.VisibleDeprecationWarning)        
    
 
 class da_trainer(object):
@@ -117,8 +115,6 @@ class da_trainer(object):
                 df_a.to_csv(path,sep = ',')
                 path_s =  os.path.join(self.avg_res_dir, 'test_source_results.csv')
                 df_s.to_csv(path_s,sep = ',')
-                plot_losses(loss_history, self.avg_res_dir, run_id)
-                plot_metrics(acc_history, f1_history, self.avg_res_dir, run_id)
 
        
         df_a = self.avg_result(df_a)
@@ -180,7 +176,6 @@ class da_trainer(object):
                 self.algorithm = algorithm
                 source_loss_history = {}
                 target_loss_history = {}
-                acc_history, f1_history = [], []
 
 
                 # Average meters
@@ -216,7 +211,7 @@ class da_trainer(object):
                                 
 
                         
-                        if step // self.args.print_freq == 0:
+                        if step % self.args.print_freq == 0:
                             keys = loss_avg_meters.keys()
                             train_log = 'epoch {}   '.format(epoch)
                             for key in keys:
@@ -224,20 +219,18 @@ class da_trainer(object):
 
                             self.logger.debug(train_log)
 
-                    # logging
-                    # self.logger.debug(f'[Epoch : {epoch}/{self.hparams["num_epochs"]}]')
-                    self.logger.debug('Epoch Testing {}/{}'.format(epoch, self.args.num_epochs))
-                
-                   # testing
-                    acc, f1 = self.evaluate()
-                    self.logger.debug('acc {}   f1 {}'.format(acc, f1))
-                    acc_history.append(acc)
-                    f1_history.append(f1)
-                    if f1>=self.best_f1:
-                        self.best_f1 = f1
-                        self.logger.debug('best model {}'.format(epoch))
-                        algorithm.save_model(self.model_path)
-            
+                    self.logger.debug(
+                        'Epoch completed {}/{}'.format(
+                            epoch,
+                            self.args.num_epochs
+                        )
+                    )
+
+                # Save the final-epoch model only.
+                # This avoids target-label model selection during UDA training.
+                self.logger.debug('Saving ACTA final-epoch model')
+                algorithm.save_model(self.model_path)
+
                 # test target
                 acc, f1 = self.evaluate(final=True)
                 log = {'scenario':i,'run_id':run_id,'accuracy':acc,'f1':f1}
@@ -254,10 +247,6 @@ class da_trainer(object):
                 df_a.to_csv(path,sep = ',')
                 path_s =  os.path.join(self.avg_res_dir, 'source_results.csv')
                 df_s.to_csv(path_s,sep = ',')
-                # save plots         
-                plot_losses(source_loss_history, self.avg_res_dir, run_id, mode="source")
-                plot_losses(target_loss_history, self.avg_res_dir, run_id, mode="target")
-                plot_metrics(acc_history, f1_history, self.avg_res_dir, run_id, mode="target")
 
 
 
@@ -351,4 +340,3 @@ class da_trainer(object):
         df = pd.concat([df, pd.DataFrame(log)], ignore_index=True)
 
         return df
-    
