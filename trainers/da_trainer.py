@@ -306,37 +306,110 @@ class da_trainer(object):
             os.mkdir(self.save_dir)
 
     def avg_result(self, df):
+        """
+        Robust aggregation across runs/scenarios.
 
-        empty_row = [{'scenario': None, 'run_id': None, 'accuracy': None, 'f1': None}]
-        df = pd.concat([df, pd.DataFrame(empty_row)], ignore_index=True)
+        Keeps accuracy/f1 numeric and avoids inserting a None row,
+        which can coerce pandas columns to object dtype on newer
+        pandas versions.
+        """
 
-        mean_acc = df.groupby('scenario', as_index=False, sort=False)['accuracy'].mean(numeric_only=True)
-        mean_f1 = df.groupby('scenario', as_index=False, sort=False)['f1'].mean(numeric_only=True)
-        std_acc = df.groupby('scenario', as_index=False, sort=False)['accuracy'].std(numeric_only=True)
-        std_f1 =  df.groupby('scenario', as_index=False, sort=False)['f1'].std(numeric_only=True)
+        if df.empty:
+            return df
 
-        print(mean_acc)
-        print(std_acc)
+        work = df.copy()
 
-        for i in range(len(mean_acc)):
-            log = [{'scenario':mean_acc['scenario'][i],'run_id':'all','accuracy':mean_acc['accuracy'][i],'f1':mean_f1['f1'][i]}]
-            log.append({'scenario':mean_acc['scenario'][i],'run_id':'all','accuracy':std_acc['accuracy'][i],'f1':std_f1['f1'][i]})
-            df = pd.concat([df, pd.DataFrame(log)], ignore_index=True)
-        
-        all_mean_acc = mean_acc['accuracy'].mean()
-        all_mean_f1 = mean_f1['f1'].mean()
-        all_mean_acc_std = std_acc['accuracy'].mean()
-        all_mean_f1_std = std_f1['f1'].mean()
-        log = [
-            {'scenario':'all_mean_acc',
-                'run_id':'all_mean_acc_std',
-                'accuracy':'all_mean_f1',
-                'f1':'all_mean_f1_std'},
-            {'scenario':all_mean_acc,
-                'run_id':all_mean_acc_std,
-                'accuracy':all_mean_f1,
-                'f1':all_mean_f1_std}]
-        
-        df = pd.concat([df, pd.DataFrame(log)], ignore_index=True)
+        work["accuracy"] = pd.to_numeric(
+            work["accuracy"],
+            errors="coerce",
+        )
+        work["f1"] = pd.to_numeric(
+            work["f1"],
+            errors="coerce",
+        )
 
-        return df
+        valid = work.dropna(
+            subset=["scenario", "accuracy", "f1"]
+        ).copy()
+
+        grouped = (
+            valid
+            .groupby(
+                "scenario",
+                as_index=False,
+                sort=False,
+            )
+            .agg(
+                accuracy_mean=("accuracy", "mean"),
+                accuracy_std=("accuracy", "std"),
+                f1_mean=("f1", "mean"),
+                f1_std=("f1", "std"),
+            )
+        )
+
+        print(
+            grouped[
+                ["scenario", "accuracy_mean"]
+            ].rename(
+                columns={"accuracy_mean": "accuracy"}
+            )
+        )
+
+        print(
+            grouped[
+                ["scenario", "accuracy_std"]
+            ].rename(
+                columns={"accuracy_std": "accuracy"}
+            )
+        )
+
+        summary_rows = []
+
+        for _, row in grouped.iterrows():
+            summary_rows.append(
+                {
+                    "scenario": row["scenario"],
+                    "run_id": "mean",
+                    "accuracy": row["accuracy_mean"],
+                    "f1": row["f1_mean"],
+                }
+            )
+
+            summary_rows.append(
+                {
+                    "scenario": row["scenario"],
+                    "run_id": "std",
+                    "accuracy": row["accuracy_std"],
+                    "f1": row["f1_std"],
+                }
+            )
+
+        if len(grouped) > 0:
+            summary_rows.append(
+                {
+                    "scenario": "all_mean",
+                    "run_id": "all",
+                    "accuracy": grouped["accuracy_mean"].mean(),
+                    "f1": grouped["f1_mean"].mean(),
+                }
+            )
+
+            summary_rows.append(
+                {
+                    "scenario": "mean_scenario_std",
+                    "run_id": "all",
+                    "accuracy": grouped["accuracy_std"].mean(),
+                    "f1": grouped["f1_std"].mean(),
+                }
+            )
+
+        if summary_rows:
+            work = pd.concat(
+                [
+                    work,
+                    pd.DataFrame(summary_rows),
+                ],
+                ignore_index=True,
+            )
+
+        return work
