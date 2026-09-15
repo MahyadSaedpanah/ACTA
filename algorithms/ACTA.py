@@ -1,204 +1,198 @@
+import copy
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from utils.loss import ConditionalEntropyLoss
+
 from algorithms.algorithms_base import Algorithm
 from utils.module import *
 
 
-    
-class ACON(Algorithm):
+class ACTA(Algorithm):
+    """
+    ACTA - clean implementation skeleton.
+
+    Stage 1 only:
+        - benchmark CNN backbone
+        - benchmark temporal classifier
+        - source supervised task update
+        - EMA teacher
+
+    No TSA gate, selector, warp bank, discriminator, or DCG is added yet.
+    Those will be integrated one-by-one after this skeleton is verified.
+    """
 
     def __init__(self, configs, device, args):
-        super(ACON, self).__init__(configs)
+        super(ACTA, self).__init__(configs)
 
-        # hyperparameters
         self.args = args
         self.device = device
-        self.period = configs.period
-        self.avg_mode = configs.avg_mode
-        self.fft_mode = self.period // 2 + 1
-        assert self.avg_mode < self.fft_mode
-        self.kl_t = args.kl_t
 
-        # model
+        # Benchmark task model
         self.t_feature_extractor = CNN(configs)
-        self.t_classifier = TemporalClassifierHead(self.t_feature_extractor.out_dim, configs.num_classes)
-        self.domain_classifier = Discriminator(self.t_feature_extractor.out_dim*self.avg_mode, self.args.disc_hid_dim)
-        self.f_feature_extractor = FrequencyEncoder(configs.input_channels, configs.input_channels, self.fft_mode, configs.fft_normalize)
-        self.f_classifier = FrequencyClassifierHead(self.fft_mode * configs.input_channels, configs.num_classes)
-        self.avg_pooling = nn.AdaptiveAvgPool1d(self.avg_mode)
-        
-
-        # optimizers
-        self.optimizer = torch.optim.Adam([
-            {'params': self.t_feature_extractor.parameters()},
-	        {'params': self.t_classifier.parameters()},
-            {'params': self.f_feature_extractor.parameters()},
-            {'params': self.f_classifier.parameters()}],
-            lr=args.lr,
-            weight_decay=args.weight_decay
+        self.t_classifier = TemporalClassifierHead(
+            self.t_feature_extractor.out_dim,
+            configs.num_classes,
         )
-       
-        self.optimizer_disc = torch.optim.Adam(
-            self.domain_classifier.parameters(),
-            lr=args.lr,
-            weight_decay=args.weight_decay
+
+        # EMA teacher
+        self.ema_decay = float(getattr(args, "acta_ema", 0.99))
+
+        self.ema_feature_extractor = copy.deepcopy(
+            self.t_feature_extractor
         )
-      
-        self.criterion_cond = ConditionalEntropyLoss().to(device)
-        self.kl = nn.KLDivLoss(reduction=args.kl_reduction)
+        self.ema_classifier = copy.deepcopy(
+            self.t_classifier
+        )
+        self._freeze_ema()
 
+        # Task optimizer
+        self.optimizer_task = torch.optim.Adam(
+            [
+                {"params": self.t_feature_extractor.parameters()},
+                {"params": self.t_classifier.parameters()},
+            ],
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
 
-    def period_data(self, x, period):
-        B = x.size(0)
-        N = x.size(1)
-        # padding
-        if x.size(2) % period != 0:
-            length = ((x.size(-1) // period) + 1) * period
-            padding = torch.zeros([x.shape[0], x.shape[1], (length - (x.size(2)))]).to(x.device)
-            out = torch.cat([x, padding], dim=2)
-        else:
-            length = x.size(2)
-            out = x
-        # reshape
-        out = out.reshape(B, N, length // period, period).contiguous()
-        # print(out.shape)
-        return out
+    def _freeze_ema(self):
+        self.ema_feature_extractor.eval()
+        self.ema_classifier.eval()
 
-    def get_amplitude(self, x_fft):
-        a = x_fft.abs()
-        if a.dim() == 4:
-            a = a.mean(dim=2)
-        a_disc = a[:, :, :self.fft_mode]
-        a_disc = self.avg_pooling(a_disc.mean(dim=1)).softmax(-1)
-        a_cls = a[:, :, :self.fft_mode]
-        a_cls = a_cls.reshape(a_cls.size(0), -1)
-        return a_cls, a_disc
-    
-    
+        for module in (
+            self.ema_feature_extractor,
+            self.ema_classifier,
+        ):
+            for param in module.parameters():
+                param.requires_grad = False
+
+    @torch.no_grad()
+    def update_ema(self):
+        d = self.ema_decay
+
+        for ema_param, param in zip(
+            self.ema_feature_extractor.parameters(),
+            self.t_feature_extractor.parameters(),
+        ):
+            ema_param.mul_(d).add_(param, alpha=1.0 - d)
+
+        for ema_param, param in zip(
+            self.ema_classifier.parameters(),
+            self.t_classifier.parameters(),
+        ):
+            ema_param.mul_(d).add_(param, alpha=1.0 - d)
+
+        for ema_buffer, buffer in zip(
+            self.ema_feature_extractor.buffers(),
+            self.t_feature_extractor.buffers(),
+        ):
+            ema_buffer.copy_(buffer)
+
+        for ema_buffer, buffer in zip(
+            self.ema_classifier.buffers(),
+            self.t_classifier.buffers(),
+        ):
+            ema_buffer.copy_(buffer)
+
+        self._freeze_ema()
+
+    def encode(self, x):
+        return self.t_feature_extractor(x)
+
+    def classify(self, z):
+        return self.t_classifier(z)
+
+    @torch.no_grad()
+    def ema_predict(self, x):
+        self.ema_feature_extractor.eval()
+        self.ema_classifier.eval()
+
+        feat = self.ema_feature_extractor(x)
+        logits = self.ema_classifier(feat)
+
+        return torch.softmax(logits, dim=-1)
+
     def update(self, src_x, src_y, trg_x):
-        bs = src_x.size(0)
+        """
+        Stage 1 intentionally performs only the source supervised
+        task update.
 
-        # prepare true domain labels
-        domain_label_src = torch.ones(len(src_x)).to(self.device)
-        domain_label_trg = torch.zeros(len(trg_x)).to(self.device)
-        domain_label_concat = torch.cat((domain_label_src, domain_label_trg), 0).long()
+        trg_x is accepted to preserve the benchmark DA trainer API,
+        but it is not used yet.
+        """
 
-        # source features and predictions
-        src_t_feat = self.t_feature_extractor(src_x)
-        src_t_pred = self.t_classifier(src_t_feat)
+        self.t_feature_extractor.train()
+        self.t_classifier.train()
 
-        # target features and predictions
-        trg_t_feat = self.t_feature_extractor(trg_x)
-        trg_t_pred = self.t_classifier(trg_t_feat)
+        src_feat = self.t_feature_extractor(src_x)
+        src_pred = self.t_classifier(src_feat)
 
-        # concatenate features
-        feat_concat = torch.cat((src_t_feat, trg_t_feat), dim=0)
+        source_loss = self.cross_entropy(
+            src_pred.squeeze(),
+            src_y,
+        )
 
-        
-        
-        src_f_feat = self.f_feature_extractor(self.period_data(src_x,self.period))
-        trg_f_feat = self.f_feature_extractor(self.period_data(trg_x,self.period))
-        src_a_cls, src_a_disc = self.get_amplitude(src_f_feat)
-        trg_a_cls, trg_a_disc = self.get_amplitude(trg_f_feat)
-        src_f_pred, src_f_feat = self.f_classifier(src_a_cls, True)
-        trg_f_pred, trg_f_feat = self.f_classifier(trg_a_cls, True)
+        self.optimizer_task.zero_grad()
+        source_loss.backward()
+        self.optimizer_task.step()
 
-        
-        src_a_disc = self.avg_pooling(src_f_feat).softmax(-1)
-        trg_a_disc = self.avg_pooling(trg_f_feat).softmax(-1)
+        self.update_ema()
 
+        return {
+            "Source_loss": float(source_loss.detach().item())
+        }
 
-
-        ft_a_concat = torch.cat([src_a_disc, trg_a_disc], dim=0)
-
-        # Domain classification loss
-        feat_x_pred = torch.bmm(ft_a_concat.unsqueeze(2), feat_concat.unsqueeze(1)).view(bs*2, -1).detach()
-        disc_prediction = self.domain_classifier(feat_x_pred)
-        disc_loss = self.cross_entropy(disc_prediction, domain_label_concat)
-        domain_acc = self.get_domain_acc(disc_prediction, domain_label_concat)
-
-        # update Domain classification
-        self.optimizer_disc.zero_grad()
-        disc_loss.backward()
-        self.optimizer_disc.step()
-
-        # prepare fake domain labels for training the feature extractor
-        domain_label_src = torch.zeros(len(src_x)).long().to(self.device)
-        domain_label_trg = torch.ones(len(trg_x)).long().to(self.device)
-        domain_label_concat = torch.cat((domain_label_src, domain_label_trg), 0)
-
-        # Repeat predictions after updating discriminator
-        feat_x_pred = torch.bmm(ft_a_concat.unsqueeze(2), feat_concat.unsqueeze(1)).view(bs*2, -1)
-        disc_prediction = self.domain_classifier(feat_x_pred)
-        # loss of domain discriminator according to fake labels
-        domain_loss = self.cross_entropy(disc_prediction, domain_label_concat)
-
-        # Task classification  Loss
-        src_t_cls_loss = self.cross_entropy(src_t_pred.squeeze(), src_y)
-        src_f_cls_loss = self.cross_entropy(src_f_pred.squeeze(), src_y)
-
-        # align temporal domain and spetral domain
-        align_s_tf_loss = self.kl(F.log_softmax(src_t_pred / self.kl_t, dim=-1), F.softmax(src_f_pred / self.kl_t, dim=-1)+1e-5)
-        align_t_tf_loss = self.kl(F.log_softmax(trg_f_pred / self.kl_t, dim=-1), F.softmax(trg_t_pred / self.kl_t, dim=-1))        
-        
-        # conditional entropy loss.
-        entropy_trg_t = self.criterion_cond(trg_t_pred)
-        entropy_trg_f = self.criterion_cond(trg_f_pred)
-
-        loss = self.args.cls_trade_off * (src_t_cls_loss + src_f_cls_loss) \
-               + self.args.domain_trade_off * domain_loss \
-               + self.args.entropy_trade_off * (entropy_trg_t + entropy_trg_f) \
-               + self.args.align_t_trade_off * align_t_tf_loss \
-               + self.args.align_s_trade_off * align_s_tf_loss \
-
-
-        # update feature extractor
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-
-        return {'Src_t_cls_loss': src_t_cls_loss.item(), 
-                'Src_f_cls_loss': src_f_cls_loss.item(), 
-                'Domain_loss': domain_loss.item(), 
-                'align source tf loss': align_s_tf_loss.item(),
-                'align target tf loss': align_t_tf_loss.item(),
-                'cond_ent_loss_t': entropy_trg_t.item(),
-                'cond_ent_loss_f': entropy_trg_f.item(),
-                'domain acc': domain_acc.item()}
-    
-    '''return predictions'''
     def predict(self, data):
         self.t_feature_extractor.eval()
         self.t_classifier.eval()
+
         with torch.no_grad():
-            t_feat = self.t_feature_extractor(data)
-            pred = self.t_classifier(t_feat)
+            feat = self.t_feature_extractor(data)
+            pred = self.t_classifier(feat)
+
         return pred
-        
-       
 
     def save_model(self, path):
-        torch.save({
-            't_encoder': self.t_feature_extractor.state_dict(),
-            't_classifier': self.t_classifier.state_dict(),
-            'domain_classifier':self.domain_classifier.state_dict(),
-            'f_encoder':self.f_feature_extractor.state_dict(),
-            'f_classifier':self.f_classifier.state_dict(),
-        }, path)
+        torch.save(
+            {
+                "t_encoder": self.t_feature_extractor.state_dict(),
+                "t_classifier": self.t_classifier.state_dict(),
+                "ema_encoder": self.ema_feature_extractor.state_dict(),
+                "ema_classifier": self.ema_classifier.state_dict(),
+            },
+            path,
+        )
 
     def load_model(self, path):
-        checkpoint = torch.load(path, map_location='cpu')
-        self.t_feature_extractor.load_state_dict(checkpoint['t_encoder'])
-        self.t_classifier.load_state_dict(checkpoint['t_classifier'])
-        self.f_feature_extractor.load_state_dict(checkpoint['f_encoder'])
-        self.f_classifier.load_state_dict(checkpoint['f_classifier'])
+        checkpoint = torch.load(
+            path,
+            map_location="cpu",
+        )
 
-    def get_domain_acc(self, pred, label):
-        pred = torch.argmax(pred, dim=1)
-        res = torch.sum(torch.eq(pred, label)) / label.size(0)
-        return res
+        self.t_feature_extractor.load_state_dict(
+            checkpoint["t_encoder"]
+        )
+        self.t_classifier.load_state_dict(
+            checkpoint["t_classifier"]
+        )
 
+        if "ema_encoder" in checkpoint:
+            self.ema_feature_extractor.load_state_dict(
+                checkpoint["ema_encoder"]
+            )
+        else:
+            self.ema_feature_extractor.load_state_dict(
+                checkpoint["t_encoder"]
+            )
 
+        if "ema_classifier" in checkpoint:
+            self.ema_classifier.load_state_dict(
+                checkpoint["ema_classifier"]
+            )
+        else:
+            self.ema_classifier.load_state_dict(
+                checkpoint["t_classifier"]
+            )
 
+        self._freeze_ema()
+        return self
