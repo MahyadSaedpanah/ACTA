@@ -20,7 +20,7 @@ parser.add_argument('--run_description', default='ACON', type=str, help='name of
 parser.add_argument('--da_method', default='ACON', type=str)
 
 # ========= Select the DATASET ==============
-parser.add_argument('--data_path', default="/content/ACTA/data", type=str, help='Path containing dataset')
+parser.add_argument('--data_path', default='/home/mahyad/projects/ACON/data', type=str, help='Path containing dataset')
 parser.add_argument('--dataset', default='UCIHAR',type=str)
 
 # ========= Select the BACKBONE ==============
@@ -38,70 +38,6 @@ parser.add_argument('--end', type=int, default=None)
 parser.add_argument('-p','--print-freq', type=int, default=10, help='each epoch print num_epochs/p times ')
 parser.add_argument('--num_workers', type=int, default=2)
 parser.add_argument('--shuffle', action='store_true', help='whether shuffle the train dataset')
-
-# ========= ACTA / ACTA-v2 ===================
-parser.add_argument(
-    '--acta_mode',
-    type=str,
-    default='ACTA',
-    choices=[
-        'ACTA',
-        'RFT',
-        'UNIFORM',
-        'LegacyACTA',
-        'UTA',
-        'ClassShuffle',
-    ]
-)
-
-parser.add_argument(
-    '--acta_k',
-    type=int,
-    default=2
-)
-
-parser.add_argument(
-    '--acta_beta',
-    type=float,
-    default=1.0
-)
-
-parser.add_argument(
-    '--acta_eta',
-    type=float,
-    default=1.0
-)
-
-parser.add_argument(
-    '--acta_lambda',
-    type=float,
-    default=1.0
-)
-
-parser.add_argument(
-    '--acta_gamma',
-    type=float,
-    default=0.1
-)
-
-parser.add_argument(
-    '--acta_ema',
-    type=float,
-    default=0.99
-)
-
-parser.add_argument(
-    '--source_model_root',
-    type=str,
-    default='source_models'
-)
-
-parser.add_argument(
-    '--semantic_root',
-    type=str,
-    default='semantic_packages'
-)
-
 parser.add_argument('--phase', default='train', type=str)
 parser.add_argument('--test_model_prefix', type=str)
 
@@ -131,9 +67,11 @@ if args.debug:
 
 
 if __name__ == "__main__":
-
+    
     trainer = trainers.da_trainer(args)
     if args.phase == 'test':
         trainer.test()
     else:
         trainer.train()
+    
+   

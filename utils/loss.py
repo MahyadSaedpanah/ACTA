@@ -1,11 +1,5 @@
-"""
-@author: Mingyang Liu
-@contact: mingyang1024@gmail.com
-"""
-
 import torch
 import torch.nn.functional as F
-
 
 class ConditionalEntropyLoss(torch.nn.Module):
     def __init__(self):

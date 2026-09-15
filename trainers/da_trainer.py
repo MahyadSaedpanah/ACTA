@@ -1,8 +1,3 @@
-"""
-@author: Mingyang Liu
-@contact: mingyang1024@gmail.com
-"""
-
 import torch
 import os
 import sys
@@ -183,21 +178,6 @@ class da_trainer(object):
                 
                 algorithm.to(self.device)
                 self.algorithm = algorithm
-                # ------------------------------------------------
-                # ACTA-specific Stage-B context
-                # ------------------------------------------------
-                if self.da_method == "ACTA":
-
-                    algorithm.configure_source_context(
-                        dataset_name=self.dataset,
-                        source_id=src_id,
-                        seed=run_id,
-                    )
-
-                    algorithm.attach_source_reference_pool(
-                        self.src_train_dl.dataset,
-                        reference_seed=run_id,
-                    )
                 source_loss_history = {}
                 target_loss_history = {}
                 acc_history, f1_history = [], []
@@ -248,61 +228,15 @@ class da_trainer(object):
                     # self.logger.debug(f'[Epoch : {epoch}/{self.hparams["num_epochs"]}]')
                     self.logger.debug('Epoch Testing {}/{}'.format(epoch, self.args.num_epochs))
                 
-                    # testing
-                    # ------------------------------------------------
-                    # Model selection
-                    # ------------------------------------------------
-
-                    if self.da_method == "ACTA":
-
-                        # Clean ACTA protocol:
-                        # target labels are NOT used during training
-                        # or checkpoint selection.
-                        #
-                        # Save only the fixed final-epoch model.
-                        self.logger.debug(
-                            'Epoch completed {}/{}'
-                            .format(
-                                epoch,
-                                self.args.num_epochs
-                            )
-                        )
-
-                        if epoch == self.args.num_epochs:
-
-                            self.logger.debug(
-                                'Saving ACTA final-epoch model'
-                            )
-
-                            algorithm.save_model(
-                                self.model_path
-                            )
-
-                    else:
-
-                        # Preserve historical baseline behavior.
-                        acc, f1 = self.evaluate()
-
-                        self.logger.debug(
-                            'acc {}   f1 {}'
-                            .format(acc, f1)
-                        )
-
-                        acc_history.append(acc)
-                        f1_history.append(f1)
-
-                        if f1 >= self.best_f1:
-
-                            self.best_f1 = f1
-
-                            self.logger.debug(
-                                'best model {}'
-                                .format(epoch)
-                            )
-
-                            algorithm.save_model(
-                                self.model_path
-                            )
+                   # testing
+                    acc, f1 = self.evaluate()
+                    self.logger.debug('acc {}   f1 {}'.format(acc, f1))
+                    acc_history.append(acc)
+                    f1_history.append(f1)
+                    if f1>=self.best_f1:
+                        self.best_f1 = f1
+                        self.logger.debug('best model {}'.format(epoch))
+                        algorithm.save_model(self.model_path)
             
                 # test target
                 acc, f1 = self.evaluate(final=True)
@@ -384,54 +318,13 @@ class da_trainer(object):
 
     def avg_result(self, df):
 
-        df = df.copy()
-
-        df["accuracy"] = pd.to_numeric(
-            df["accuracy"],
-            errors="coerce"
-        )
-
-        df["f1"] = pd.to_numeric(
-            df["f1"],
-            errors="coerce"
-        )
-
-    def avg_result(self, df):
-
         empty_row = [{'scenario': None, 'run_id': None, 'accuracy': None, 'f1': None}]
         df = pd.concat([df, pd.DataFrame(empty_row)], ignore_index=True)
 
-        mean_acc = (
-            df.groupby(
-                "scenario",
-                as_index=False,
-                sort=False
-            )["accuracy"].mean()
-        )
-
-        mean_f1 = (
-            df.groupby(
-                "scenario",
-                as_index=False,
-                sort=False
-            )["f1"].mean()
-        )
-
-        std_acc = (
-            df.groupby(
-                "scenario",
-                as_index=False,
-                sort=False
-            )["accuracy"].std()
-        )
-
-        std_f1 = (
-            df.groupby(
-                "scenario",
-                as_index=False,
-                sort=False
-            )["f1"].std()
-        )
+        mean_acc = df.groupby('scenario', as_index=False, sort=False)['accuracy'].mean(numeric_only=True)
+        mean_f1 = df.groupby('scenario', as_index=False, sort=False)['f1'].mean(numeric_only=True)
+        std_acc = df.groupby('scenario', as_index=False, sort=False)['accuracy'].std(numeric_only=True)
+        std_f1 =  df.groupby('scenario', as_index=False, sort=False)['f1'].std(numeric_only=True)
 
         print(mean_acc)
         print(std_acc)

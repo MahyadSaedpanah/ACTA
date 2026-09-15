@@ -1,8 +1,3 @@
-"""
-@author: Mingyang Liu
-@contact: mingyang1024@gmail.com
-"""
-
 import random
 import os
 import sys
