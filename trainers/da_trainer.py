@@ -248,15 +248,19 @@ class da_trainer(object):
                             self.device
                         )
 
-                        selector_out = (
-                            algorithm.selector_weights_from_target(
+                        correction_out = (
+                            algorithm.correct_target(
                                 target_x
                             )
                         )
 
-                        gate = selector_out["gate"]
-                        reliability = selector_out["reliability"]
-                        alpha = selector_out["alpha"]
+                        gate = correction_out["gate"]
+                        reliability = correction_out["reliability"]
+                        alpha = correction_out["alpha"]
+                        corrected_x = correction_out["corrected_x"]
+                        corrected_logits = correction_out[
+                            "corrected_logits"
+                        ]
 
                         entropy = -(
                             alpha
@@ -265,8 +269,61 @@ class da_trainer(object):
                             )
                         ).sum(dim=1)
 
+                        delta = corrected_x - target_x
+
+                        relative_l2 = (
+                            delta.flatten(1).norm(dim=1)
+                            /
+                            target_x.flatten(1)
+                            .norm(dim=1)
+                            .clamp_min(1e-8)
+                        )
+
+                        mapping = algorithm.correction_mapping(
+                            alpha=alpha,
+                            length=target_x.shape[-1],
+                            dtype=target_x.dtype,
+                            device=target_x.device,
+                        )
+
+                        identity_map = torch.linspace(
+                            0.0,
+                            1.0,
+                            steps=target_x.shape[-1],
+                            device=target_x.device,
+                            dtype=target_x.dtype,
+                        ).unsqueeze(0)
+
+                        displacement = (
+                            mapping - identity_map
+                        ).abs()
+
+                        with torch.no_grad():
+                            original_feat = (
+                                algorithm.t_feature_extractor(
+                                    target_x
+                                )
+                            )
+                            original_logits = (
+                                algorithm.t_classifier(
+                                    original_feat
+                                )
+                            )
+
+                            original_pred = (
+                                original_logits.argmax(dim=1)
+                            )
+                            corrected_pred = (
+                                corrected_logits.argmax(dim=1)
+                            )
+
+                            prediction_change_rate = (
+                                original_pred
+                                != corrected_pred
+                            ).float().mean()
+
                         self.logger.debug(
-                            "TSA selector diagnostic: {}".format(
+                            "Temporal correction diagnostic: {}".format(
                                 {
                                     "reliability_mean": float(
                                         reliability.mean().item()
@@ -274,14 +331,13 @@ class da_trainer(object):
                                     "gate_nonidentity_mean": float(
                                         gate[:, 1:].mean().item()
                                     ),
-                                    "identity_gate_mean": float(
-                                        gate[:, 0].mean().item()
-                                    ),
                                     "alpha_identity_mean": float(
                                         alpha[:, 0].mean().item()
                                     ),
                                     "alpha_max_mean": float(
-                                        alpha.max(dim=1).values.mean().item()
+                                        alpha.max(
+                                            dim=1
+                                        ).values.mean().item()
                                     ),
                                     "alpha_entropy_mean": float(
                                         entropy.mean().item()
@@ -291,6 +347,23 @@ class da_trainer(object):
                                             alpha.sum(dim=1)
                                             - 1.0
                                         ).abs().max().item()
+                                    ),
+                                    "mapping_max_displacement": float(
+                                        displacement.max().item()
+                                    ),
+                                    "mapping_mean_displacement": float(
+                                        displacement.mean().item()
+                                    ),
+                                    "relative_l2_correction_mean": float(
+                                        relative_l2.mean().item()
+                                    ),
+                                    "prediction_change_rate": float(
+                                        prediction_change_rate.item()
+                                    ),
+                                    "corrected_is_finite": bool(
+                                        torch.isfinite(
+                                            corrected_x
+                                        ).all().item()
                                     ),
                                 }
                             )

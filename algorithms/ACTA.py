@@ -570,6 +570,77 @@ class ACTA(Algorithm):
             "class_probs": gate_out["class_probs"],
         }
 
+    def correct_target(self, target_x):
+        """
+        Apply the current TSA-constrained sample-specific temporal
+        correction and run the corrected target through the benchmark
+        CNN a second time.
+
+        Pipeline:
+            x_t
+              -> CNN -> z_t
+              -> Selector -> q
+              -> TSA Gate
+              -> alpha
+              -> phi*(alpha)
+              -> differentiable temporal resampling
+              -> x_t'
+              -> CNN -> z_t'
+              -> classifier
+
+        At this stage the selector is still untrained. This function
+        only verifies that the complete correction path is valid and
+        differentiable.
+        """
+
+        selector_out = self.selector_weights_from_target(
+            target_x
+        )
+
+        alpha = selector_out["alpha"]
+
+        corrected_x = self.warp_bank.mix(
+            target_x,
+            alpha,
+        )
+
+        corrected_z = self.t_feature_extractor(
+            corrected_x
+        )
+
+        corrected_logits = self.t_classifier(
+            corrected_z
+        )
+
+        selector_out.update(
+            {
+                "corrected_x": corrected_x,
+                "corrected_z": corrected_z,
+                "corrected_logits": corrected_logits,
+            }
+        )
+
+        return selector_out
+
+    def correction_mapping(self, alpha, length, dtype, device):
+        """
+        Return the normalized temporal map phi*(u) corresponding to a
+        batch of selector weights.
+
+        alpha:
+            [B, M]
+
+        returns:
+            [B, T] in [0,1]
+        """
+        mappings = self.warp_bank.normalized_mappings(
+            length=length,
+            device=device,
+            dtype=dtype,
+        )
+
+        return alpha @ mappings
+
     def update(self, src_x, src_y, trg_x):
         """
         Stage 1 intentionally performs only the source supervised
