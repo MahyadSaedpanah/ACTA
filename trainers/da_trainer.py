@@ -226,6 +226,19 @@ class da_trainer(object):
                         )
                     )
 
+                # Build source-only TSA codebook after the source-task
+                # training stage. Target data is never used here.
+                if hasattr(algorithm, "build_tsa_codebook"):
+                    self.logger.debug(
+                        "Building source-only TSA codebook"
+                    )
+                    tsa_summary = algorithm.build_tsa_codebook(
+                        self.src_train_dl
+                    )
+                    self.logger.debug(
+                        "TSA codebook: {}".format(tsa_summary)
+                    )
+
                 # Save the final-epoch model only.
                 # This avoids target-label model selection during UDA training.
                 self.logger.debug('Saving ACTA final-epoch model')
