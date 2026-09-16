@@ -464,7 +464,7 @@ class ACTA(Algorithm):
         Reliability is kept separate:
 
             teacher_accuracy[c]
-                = source EMA accuracy for class c
+                = source task-model accuracy for class c
 
             order_stability[c]
                 = agreement of warp excess-risk geometry between
@@ -476,8 +476,8 @@ class ACTA(Algorithm):
         No target data is used.
         """
 
-        self.ema_feature_extractor.eval()
-        self.ema_classifier.eval()
+        self.t_feature_extractor.eval()
+        self.t_classifier.eval()
 
         C = int(self.configs.num_classes)
         M = int(self.warp_bank.num_warps)
@@ -511,8 +511,8 @@ class ACTA(Algorithm):
             B = int(source_x.shape[0])
 
             # Unwarped source prediction only measures teacher quality.
-            base_feat = self.ema_feature_extractor(source_x)
-            base_logits = self.ema_classifier(base_feat)
+            base_feat = self.t_feature_extractor(source_x)
+            base_logits = self.t_classifier(base_feat)
             base_pred = base_logits.argmax(dim=1)
 
             # Evaluate all temporal actions with the same frozen EMA teacher.
@@ -524,8 +524,8 @@ class ACTA(Algorithm):
                 source_x.shape[2],
             )
 
-            warped_feat = self.ema_feature_extractor(flat_warped)
-            warped_logits = self.ema_classifier(warped_feat)
+            warped_feat = self.t_feature_extractor(flat_warped)
+            warped_logits = self.t_classifier(warped_feat)
 
             repeated_y = (
                 source_y[:, None]
