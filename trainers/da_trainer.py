@@ -131,280 +131,381 @@ class da_trainer(object):
     def train(self):
 
         run_name = f"{self.run_description}"
-        # Logging
-        self.avg_res_dir = os.path.join(self.save_dir, self.experiment_description, run_name, get_time())
-        os.makedirs(self.avg_res_dir, exist_ok=True)
 
-        self.exp_log_dir = os.path.join(self.avg_res_dir, 'res')
-        os.makedirs(self.exp_log_dir, exist_ok=True)
+        self.avg_res_dir = os.path.join(
+            self.save_dir,
+            self.experiment_description,
+            run_name,
+            get_time(),
+        )
+        os.makedirs(
+            self.avg_res_dir,
+            exist_ok=True,
+        )
 
-        command = ' '.join(sys.argv)
-        with open(os.path.join(self.avg_res_dir, 'command.txt'), "a") as file:
-            command_list = command.split('--')
+        self.exp_log_dir = os.path.join(
+            self.avg_res_dir,
+            "res",
+        )
+        os.makedirs(
+            self.exp_log_dir,
+            exist_ok=True,
+        )
+
+        command = " ".join(sys.argv)
+        with open(
+            os.path.join(
+                self.avg_res_dir,
+                "command.txt",
+            ),
+            "a",
+        ) as file:
+            command_list = command.split("--")
             for arg in command_list:
-                file.write('--'+arg+'\n')
+                file.write("--" + arg + "\n")
 
-        scenarios = self.dataset_configs.scenarios  # return the scenarios given a specific dataset.
-        df_a = pd.DataFrame(columns=['scenario','run_id','accuracy','f1'])
-        df_s = pd.DataFrame(columns=['scenario','run_id','accuracy','f1'])
+        scenarios = self.dataset_configs.scenarios
+
+        df_a = pd.DataFrame(
+            columns=[
+                "scenario",
+                "run_id",
+                "accuracy",
+                "f1",
+            ]
+        )
+        df_s = pd.DataFrame(
+            columns=[
+                "scenario",
+                "run_id",
+                "accuracy",
+                "f1",
+            ]
+        )
+
         self.trg_acc_list = []
-        for i in scenarios[self.args.start:self.args.end]:
+
+        for i in scenarios[
+            self.args.start:self.args.end
+        ]:
             src_id = i[0]
             trg_id = i[1]
 
-
-            for run_id in range(self.num_runs):  # specify number of consecutive runs
-                # fixing random seed
+            for run_id in range(self.num_runs):
                 fix_randomness(run_id)
 
-                # Logging
-                self.logger, self.scenario_log_dir = starting_logs(self.dataset, self.da_method, self.exp_log_dir,
-                                                                   src_id, trg_id, run_id)
-                self.model_path = os.path.join(self.home_path, self.scenario_log_dir, 'model.pth')
-                self.best_f1 = 0
-                # Load data
-                self.load_data(src_id, trg_id)
+                (
+                    self.logger,
+                    self.scenario_log_dir,
+                ) = starting_logs(
+                    self.dataset,
+                    self.da_method,
+                    self.exp_log_dir,
+                    src_id,
+                    trg_id,
+                    run_id,
+                )
 
-    
-                # get algorithm
+                self.model_path = os.path.join(
+                    self.home_path,
+                    self.scenario_log_dir,
+                    "model.pth",
+                )
+
+                self.load_data(
+                    src_id,
+                    trg_id,
+                )
+
                 print(self.da_method)
-               
-                algorithm_class = get_algorithm_class(self.da_method)
-                algorithm = algorithm_class(self.dataset_configs, self.device, self.args)
-                
+
+                algorithm_class = get_algorithm_class(
+                    self.da_method
+                )
+
+                algorithm = algorithm_class(
+                    self.dataset_configs,
+                    self.device,
+                    self.args,
+                )
+
                 algorithm.to(self.device)
                 self.algorithm = algorithm
-                source_loss_history = {}
-                target_loss_history = {}
 
+                self.logger.debug(
+                    "Source Train Dataset {}  "
+                    "Target Train Dataset {}".format(
+                        len(self.src_train_dl),
+                        len(self.trg_train_dl),
+                    )
+                )
 
-                # Average meters
-                loss_avg_meters = collections.defaultdict(lambda: AverageMeter())
-                self.logger.debug('Source Train Dataset {}  Target Train Dataset {}'.format(len(self.src_train_dl), len(self.trg_train_dl)))
-                # train
-                for epoch in range(1, self.args.num_epochs + 1):
-                    self.logger.debug('Epoch Training {}/{}'.format(epoch, self.args.num_epochs))
-                    joint_loaders = enumerate(zip(self.src_train_dl, self.trg_train_dl))
-                    algorithm.train()
-
-                    for step, ((src_x, src_y), (trg_x, trg_y)) in joint_loaders:
-                        src_x, src_y, trg_x, trg_y = src_x.float().to(self.device), src_y.long().to(self.device), \
-                                              trg_x.float().to(self.device), trg_y.long().to(self.device)
-
-                        
-                        losses = algorithm.update(src_x, src_y, trg_x)
-
-
-                        for key, val in losses.items():
-                            loss_avg_meters[key].update(val, src_x.size(0))
-                            # save for source
-                            if "Src" in key or "Domain" in key:
-                                if key not in source_loss_history:
-                                    source_loss_history[key] = []
-                                source_loss_history[key].append(val)
-
-                            # save for target
-                            if key in ["align target tf loss", "cond_ent_loss_t", "cond_ent_loss_f"]:
-                                if key not in target_loss_history:
-                                    target_loss_history[key] = []
-                                target_loss_history[key].append(val)
-                                
-
-                        
-                        if step % self.args.print_freq == 0:
-                            keys = loss_avg_meters.keys()
-                            train_log = 'epoch {}   '.format(epoch)
-                            for key in keys:
-                                train_log += '{}    {:.3f}({:.3f})    '.format(key,loss_avg_meters[key].val, loss_avg_meters[key].avg)
-
-                            self.logger.debug(train_log)
+                # ==========================================
+                # Stage A: source supervised pretraining
+                # ==========================================
+                for epoch in range(
+                    1,
+                    self.args.source_epochs + 1,
+                ):
+                    meters = collections.defaultdict(
+                        lambda: AverageMeter()
+                    )
 
                     self.logger.debug(
-                        'Epoch completed {}/{}'.format(
+                        "Source Epoch {}/{}".format(
                             epoch,
-                            self.args.num_epochs
+                            self.args.source_epochs,
                         )
                     )
 
-                # Build source-only TSA codebook after the source-task
-                # training stage. Target data is never used here.
-                if hasattr(algorithm, "build_tsa_codebook"):
-                    self.logger.debug(
-                        "Building source-only TSA codebook"
-                    )
-                    tsa_summary = algorithm.build_tsa_codebook(
-                        self.src_train_dl
-                    )
-                    self.logger.debug(
-                        "TSA codebook: {}".format(tsa_summary)
-                    )
+                    algorithm.train()
 
-                    # Stage-4 diagnostic only:
-                    # compute the target-specific TSA gate on one
-                    # unlabeled target batch. No optimization uses it yet.
-                    if hasattr(algorithm, "target_tsa_gate"):
-                        target_batch = next(iter(self.trg_train_dl))
-                        target_x = target_batch[0].float().to(
+                    for step, (src_x, src_y) in enumerate(
+                        self.src_train_dl
+                    ):
+                        src_x = src_x.float().to(
+                            self.device
+                        )
+                        src_y = src_y.long().to(
                             self.device
                         )
 
-                        correction_out = (
-                            algorithm.correct_target(
-                                target_x
+                        losses = algorithm.source_update(
+                            src_x,
+                            src_y,
+                        )
+
+                        for key, val in losses.items():
+                            meters[key].update(
+                                val,
+                                src_x.size(0),
                             )
-                        )
 
-                        gate = correction_out["gate"]
-                        reliability = correction_out["reliability"]
-                        alpha = correction_out["alpha"]
-                        corrected_x = correction_out["corrected_x"]
-                        corrected_logits = correction_out[
-                            "corrected_logits"
-                        ]
-
-                        entropy = -(
-                            alpha
-                            * torch.log(
-                                alpha.clamp_min(1e-8)
-                            )
-                        ).sum(dim=1)
-
-                        delta = corrected_x - target_x
-
-                        relative_l2 = (
-                            delta.flatten(1).norm(dim=1)
-                            /
-                            target_x.flatten(1)
-                            .norm(dim=1)
-                            .clamp_min(1e-8)
-                        )
-
-                        mapping = algorithm.correction_mapping(
-                            alpha=alpha,
-                            length=target_x.shape[-1],
-                            dtype=target_x.dtype,
-                            device=target_x.device,
-                        )
-
-                        identity_map = torch.linspace(
-                            0.0,
-                            1.0,
-                            steps=target_x.shape[-1],
-                            device=target_x.device,
-                            dtype=target_x.dtype,
-                        ).unsqueeze(0)
-
-                        displacement = (
-                            mapping - identity_map
-                        ).abs()
-
-                        with torch.no_grad():
-                            original_feat = (
-                                algorithm.t_feature_extractor(
-                                    target_x
+                        if (
+                            step
+                            % self.args.print_freq
+                            == 0
+                        ):
+                            train_log = (
+                                "source epoch {}   ".format(
+                                    epoch
                                 )
                             )
-                            original_logits = (
-                                algorithm.t_classifier(
-                                    original_feat
+                            for key in meters.keys():
+                                train_log += (
+                                    "{} {:.3f}({:.3f})   "
+                                ).format(
+                                    key,
+                                    meters[key].val,
+                                    meters[key].avg,
+                                )
+
+                            self.logger.debug(
+                                train_log
+                            )
+
+                # ==========================================
+                # Stage B: freeze source semantics + TSA
+                # ==========================================
+                self.logger.debug(
+                    "Preparing ACTA adaptation"
+                )
+
+                tsa_summary = (
+                    algorithm.prepare_adaptation(
+                        self.src_train_dl
+                    )
+                )
+
+                self.logger.debug(
+                    "TSA codebook: {}".format(
+                        tsa_summary
+                    )
+                )
+
+                # ==========================================
+                # Stage C: domain-guided selector training
+                # ==========================================
+                for epoch in range(
+                    1,
+                    self.args.num_epochs + 1,
+                ):
+                    meters = collections.defaultdict(
+                        lambda: AverageMeter()
+                    )
+
+                    self.logger.debug(
+                        "Adapt Epoch {}/{}".format(
+                            epoch,
+                            self.args.num_epochs,
+                        )
+                    )
+
+                    joint_loaders = enumerate(
+                        zip(
+                            self.src_train_dl,
+                            self.trg_train_dl,
+                        )
+                    )
+
+                    algorithm.train()
+
+                    for (
+                        step,
+                        (
+                            (src_x, src_y),
+                            (trg_x, _),
+                        ),
+                    ) in joint_loaders:
+                        src_x = src_x.float().to(
+                            self.device
+                        )
+                        src_y = src_y.long().to(
+                            self.device
+                        )
+                        trg_x = trg_x.float().to(
+                            self.device
+                        )
+
+                        losses = algorithm.update(
+                            src_x,
+                            src_y,
+                            trg_x,
+                        )
+
+                        for key, val in losses.items():
+                            meters[key].update(
+                                val,
+                                src_x.size(0),
+                            )
+
+                        if (
+                            step
+                            % self.args.print_freq
+                            == 0
+                        ):
+                            train_log = (
+                                "adapt epoch {}   ".format(
+                                    epoch
                                 )
                             )
 
-                            original_pred = (
-                                original_logits.argmax(dim=1)
+                            for key in meters.keys():
+                                train_log += (
+                                    "{} {:.3f}({:.3f})   "
+                                ).format(
+                                    key,
+                                    meters[key].val,
+                                    meters[key].avg,
+                                )
+
+                            self.logger.debug(
+                                train_log
                             )
-                            corrected_pred = (
-                                corrected_logits.argmax(dim=1)
-                            )
 
-                            prediction_change_rate = (
-                                original_pred
-                                != corrected_pred
-                            ).float().mean()
+                self.logger.debug(
+                    "Saving ACTA final model"
+                )
+                algorithm.save_model(
+                    self.model_path
+                )
 
-                        self.logger.debug(
-                            "Temporal correction diagnostic: {}".format(
-                                {
-                                    "reliability_mean": float(
-                                        reliability.mean().item()
-                                    ),
-                                    "gate_nonidentity_mean": float(
-                                        gate[:, 1:].mean().item()
-                                    ),
-                                    "alpha_identity_mean": float(
-                                        alpha[:, 0].mean().item()
-                                    ),
-                                    "alpha_max_mean": float(
-                                        alpha.max(
-                                            dim=1
-                                        ).values.mean().item()
-                                    ),
-                                    "alpha_entropy_mean": float(
-                                        entropy.mean().item()
-                                    ),
-                                    "alpha_row_sum_error": float(
-                                        (
-                                            alpha.sum(dim=1)
-                                            - 1.0
-                                        ).abs().max().item()
-                                    ),
-                                    "mapping_max_displacement": float(
-                                        displacement.max().item()
-                                    ),
-                                    "mapping_mean_displacement": float(
-                                        displacement.mean().item()
-                                    ),
-                                    "relative_l2_correction_mean": float(
-                                        relative_l2.mean().item()
-                                    ),
-                                    "prediction_change_rate": float(
-                                        prediction_change_rate.item()
-                                    ),
-                                    "corrected_is_finite": bool(
-                                        torch.isfinite(
-                                            corrected_x
-                                        ).all().item()
-                                    ),
-                                }
-                            )
-                        )
+                # Final target evaluation:
+                # correction is applied only to target.
+                acc, f1 = self.evaluate(
+                    final=True,
+                    data="t",
+                )
 
-                # Save the final-epoch model only.
-                # This avoids target-label model selection during UDA training.
-                self.logger.debug('Saving ACTA final-epoch model')
-                algorithm.save_model(self.model_path)
+                log = {
+                    "scenario": i,
+                    "run_id": run_id,
+                    "accuracy": acc,
+                    "f1": f1,
+                }
 
-                # test target
-                acc, f1 = self.evaluate(final=True)
-                log = {'scenario':i,'run_id':run_id,'accuracy':acc,'f1':f1}
-                self.logger.debug('target acc {} f1 {}'.format(acc, f1))
-                df_a = pd.concat([df_a, pd.DataFrame([log])], ignore_index=True)
-                
-                # test source
-                acc, f1 = self.evaluate(final=True, data='s')
-                log = {'scenario':i,'run_id':run_id,'accuracy':acc,'f1':f1}
-                self.logger.debug('source acc {} f1 {}'.format(acc, f1))
-                df_s = pd.concat([df_s, pd.DataFrame([log])], ignore_index=True)
-                
-                path =  os.path.join(self.avg_res_dir, 'target_results.csv')
-                df_a.to_csv(path,sep = ',')
-                path_s =  os.path.join(self.avg_res_dir, 'source_results.csv')
-                df_s.to_csv(path_s,sep = ',')
+                self.logger.debug(
+                    "target acc {} f1 {}".format(
+                        acc,
+                        f1,
+                    )
+                )
 
+                df_a = pd.concat(
+                    [
+                        df_a,
+                        pd.DataFrame([log]),
+                    ],
+                    ignore_index=True,
+                )
 
+                # Source evaluation remains uncorrected.
+                acc, f1 = self.evaluate(
+                    final=True,
+                    data="s",
+                )
 
+                log = {
+                    "scenario": i,
+                    "run_id": run_id,
+                    "accuracy": acc,
+                    "f1": f1,
+                }
+
+                self.logger.debug(
+                    "source acc {} f1 {}".format(
+                        acc,
+                        f1,
+                    )
+                )
+
+                df_s = pd.concat(
+                    [
+                        df_s,
+                        pd.DataFrame([log]),
+                    ],
+                    ignore_index=True,
+                )
+
+                df_a.to_csv(
+                    os.path.join(
+                        self.avg_res_dir,
+                        "target_results.csv",
+                    ),
+                    sep=",",
+                )
+
+                df_s.to_csv(
+                    os.path.join(
+                        self.avg_res_dir,
+                        "source_results.csv",
+                    ),
+                    sep=",",
+                )
 
         df_a = self.avg_result(df_a)
         df_s = self.avg_result(df_s)
 
-        path =  os.path.join(self.avg_res_dir, 'target_results.csv')
-        df_a.to_csv(path,sep = ',')
-        path_s =  os.path.join(self.avg_res_dir, 'source_results.csv')
-        df_s.to_csv(path_s,sep = ',')
+        df_a.to_csv(
+            os.path.join(
+                self.avg_res_dir,
+                "target_results.csv",
+            ),
+            sep=",",
+        )
 
-    
+        df_s.to_csv(
+            os.path.join(
+                self.avg_res_dir,
+                "source_results.csv",
+            ),
+            sep=",",
+        )
+
+
     def evaluate(self, final=False, data='t'):
         assert data in ['t', 's']
+        data_mode = data
         self.algorithm.eval()
         if final == True:
             self.algorithm.load_model(self.model_path)
@@ -422,7 +523,10 @@ class da_trainer(object):
                 data = data.float().to(self.device)
                 labels = labels.view((-1)).long().to(self.device)
 
-                predictions = self.algorithm.predict(data)
+                predictions = self.algorithm.predict(
+                    data,
+                    apply_correction=(data_mode == "t"),
+                )
 
                 # compute loss
                 pred = predictions.detach().argmax(dim=1)  # get the index of the max log-probability

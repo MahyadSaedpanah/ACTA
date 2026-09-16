@@ -78,9 +78,17 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "--source_epochs",
+    default=50,
+    type=int,
+    help="Source-only pretraining epochs",
+)
+
+parser.add_argument(
     "--num_epochs",
     default=50,
     type=int,
+    help="ACTA adaptation epochs",
 )
 
 parser.add_argument(
@@ -145,6 +153,24 @@ parser.add_argument(
     type=int,
 )
 
+parser.add_argument(
+    "--disc_hid_dim",
+    default=128,
+    type=int,
+)
+
+parser.add_argument(
+    "--selector_lr",
+    default=1e-3,
+    type=float,
+)
+
+parser.add_argument(
+    "--disc_lr",
+    default=1e-3,
+    type=float,
+)
+
 
 # ========= Phase =========
 parser.add_argument(
@@ -171,6 +197,7 @@ args = parser.parse_args()
 
 if args.debug:
     args.num_runs = 1
+    args.source_epochs = 5
     args.num_epochs = 5
     args.start = 0
     args.end = 1

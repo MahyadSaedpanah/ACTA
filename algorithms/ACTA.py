@@ -273,16 +273,17 @@ class TemporalSelector(nn.Module):
 
 class ACTA(Algorithm):
     """
-    ACTA - clean implementation skeleton.
+    ACTA.
 
-    Stage 1 only:
-        - benchmark CNN backbone
-        - benchmark temporal classifier
-        - source supervised task update
-        - EMA teacher
+    Training lifecycle:
+        1) source supervised pretraining
+        2) source-only TSA codebook construction
+        3) adaptation with a frozen source task model:
+             - discriminator learns source vs corrected-target evidence
+             - selector learns a TSA-constrained temporal correction
+               that makes corrected target features source-like
 
-    No TSA gate, selector, warp bank, discriminator, or DCG is added yet.
-    Those will be integrated one-by-one after this skeleton is verified.
+    DCG is intentionally not included yet.
     """
 
     def __init__(self, configs, device, args):
@@ -366,6 +367,28 @@ class ACTA(Algorithm):
             weight_decay=args.weight_decay,
         )
 
+        # Domain discriminator.
+        # Same 3-layer structure already provided by utils.module.
+        self.domain_classifier = Discriminator(
+            in_dim=self.t_feature_extractor.out_dim,
+            disc_hid_dim=int(getattr(args, "disc_hid_dim", 128)),
+            layer_num=3,
+        )
+
+        self.optimizer_disc = torch.optim.Adam(
+            self.domain_classifier.parameters(),
+            lr=float(getattr(args, "disc_lr", args.lr)),
+            weight_decay=args.weight_decay,
+        )
+
+        self.optimizer_selector = torch.optim.Adam(
+            self.temporal_selector.parameters(),
+            lr=float(getattr(args, "selector_lr", args.lr)),
+            weight_decay=args.weight_decay,
+        )
+
+        self.adaptation_prepared = False
+
     def _freeze_ema(self):
         self.ema_feature_extractor.eval()
         self.ema_classifier.eval()
@@ -376,6 +399,70 @@ class ACTA(Algorithm):
         ):
             for param in module.parameters():
                 param.requires_grad = False
+
+    @staticmethod
+    def _set_requires_grad(module, flag):
+        for param in module.parameters():
+            param.requires_grad = bool(flag)
+
+    @staticmethod
+    def _freeze_bn_running_stats(module):
+        """
+        Keep BatchNorm running statistics fixed while allowing Dropout
+        to remain active during adaptation.
+        """
+        for submodule in module.modules():
+            if isinstance(
+                submodule,
+                (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d),
+            ):
+                submodule.eval()
+
+    @torch.no_grad()
+    def sync_ema_from_task_model(self):
+        self.ema_feature_extractor.load_state_dict(
+            self.t_feature_extractor.state_dict()
+        )
+        self.ema_classifier.load_state_dict(
+            self.t_classifier.state_dict()
+        )
+        self._freeze_ema()
+
+    def _set_adaptation_task_mode(self):
+        """
+        Source task model is frozen during adaptation.
+
+        We keep the encoder in train mode so Dropout remains active,
+        then explicitly freeze only BatchNorm running statistics.
+        """
+        self.t_feature_extractor.train()
+        self.t_classifier.eval()
+        self._freeze_bn_running_stats(
+            self.t_feature_extractor
+        )
+
+    def freeze_task_model(self):
+        self._set_requires_grad(
+            self.t_feature_extractor,
+            False,
+        )
+        self._set_requires_grad(
+            self.t_classifier,
+            False,
+        )
+        self._set_adaptation_task_mode()
+
+    def unfreeze_task_model(self):
+        self._set_requires_grad(
+            self.t_feature_extractor,
+            True,
+        )
+        self._set_requires_grad(
+            self.t_classifier,
+            True,
+        )
+        self.t_feature_extractor.train()
+        self.t_classifier.train()
 
     @torch.no_grad()
     def update_ema(self):
@@ -641,17 +728,12 @@ class ACTA(Algorithm):
 
         return alpha @ mappings
 
-    def update(self, src_x, src_y, trg_x):
+    def source_update(self, src_x, src_y):
         """
-        Stage 1 intentionally performs only the source supervised
-        task update.
-
-        trg_x is accepted to preserve the benchmark DA trainer API,
-        but it is not used yet.
+        Supervised source pretraining step.
         """
 
-        self.t_feature_extractor.train()
-        self.t_classifier.train()
+        self.unfreeze_task_model()
 
         src_feat = self.t_feature_extractor(src_x)
         src_pred = self.t_classifier(src_feat)
@@ -668,8 +750,226 @@ class ACTA(Algorithm):
         self.update_ema()
 
         return {
-            "Source_loss": float(source_loss.detach().item()),
-            "Warp_count": float(self.warp_bank.num_warps),
+            "Source_loss": float(
+                source_loss.detach().item()
+            ),
+            "Warp_count": float(
+                self.warp_bank.num_warps
+            ),
+        }
+
+    @torch.no_grad()
+    def prepare_adaptation(self, source_loader):
+        """
+        Freeze the converged source task model, synchronize the EMA
+        teacher to it, and construct the source-only TSA codebook.
+        """
+
+        # The source model defines the semantic reference geometry.
+        self.t_feature_extractor.eval()
+        self.t_classifier.eval()
+
+        self.sync_ema_from_task_model()
+
+        summary = self.build_tsa_codebook(
+            source_loader
+        )
+
+        self.freeze_task_model()
+        self.adaptation_prepared = True
+
+        return summary
+
+    def update(self, src_x, src_y, trg_x):
+        """
+        Adaptation step.
+
+        The source task model is frozen. Only:
+            - domain discriminator
+            - temporal selector
+        are updated.
+
+        Step A:
+            train D to distinguish source from corrected target.
+
+        Step B:
+            freeze D and train Selector so corrected target is
+            classified by D as source.
+
+        No GRL is used and the CNN is not adversarially updated.
+        """
+
+        del src_y  # reserved for the next DCG stage
+
+        if not self.adaptation_prepared:
+            raise RuntimeError(
+                "ACTA adaptation was called before "
+                "prepare_adaptation()."
+            )
+
+        self.freeze_task_model()
+        self.temporal_selector.train()
+        self.domain_classifier.train()
+
+        # --------------------------------------------------
+        # A) Discriminator update
+        # --------------------------------------------------
+        self._set_requires_grad(
+            self.domain_classifier,
+            True,
+        )
+        self._set_requires_grad(
+            self.temporal_selector,
+            False,
+        )
+
+        with torch.no_grad():
+            src_z = self.t_feature_extractor(
+                src_x
+            )
+
+            corrected_out = self.correct_target(
+                trg_x
+            )
+            trg_z_corr = corrected_out[
+                "corrected_z"
+            ]
+
+        domain_src = torch.zeros(
+            src_z.shape[0],
+            dtype=torch.long,
+            device=src_z.device,
+        )
+
+        domain_trg = torch.ones(
+            trg_z_corr.shape[0],
+            dtype=torch.long,
+            device=trg_z_corr.device,
+        )
+
+        src_domain_logits = self.domain_classifier(
+            src_z.detach()
+        )
+        trg_domain_logits = self.domain_classifier(
+            trg_z_corr.detach()
+        )
+
+        disc_loss = (
+            self.cross_entropy(
+                src_domain_logits,
+                domain_src,
+            )
+            +
+            self.cross_entropy(
+                trg_domain_logits,
+                domain_trg,
+            )
+        )
+
+        self.optimizer_disc.zero_grad()
+        disc_loss.backward()
+        self.optimizer_disc.step()
+
+        with torch.no_grad():
+            disc_pred = torch.cat(
+                [
+                    src_domain_logits.argmax(dim=1),
+                    trg_domain_logits.argmax(dim=1),
+                ],
+                dim=0,
+            )
+            disc_true = torch.cat(
+                [domain_src, domain_trg],
+                dim=0,
+            )
+            domain_acc = (
+                disc_pred == disc_true
+            ).float().mean()
+
+        # --------------------------------------------------
+        # B) Selector adversarial update
+        # --------------------------------------------------
+        self._set_requires_grad(
+            self.domain_classifier,
+            False,
+        )
+        self._set_requires_grad(
+            self.temporal_selector,
+            True,
+        )
+
+        self.domain_classifier.eval()
+        self._set_adaptation_task_mode()
+
+        selector_out = self.correct_target(
+            trg_x
+        )
+
+        trg_z_corr_for_selector = selector_out[
+            "corrected_z"
+        ]
+
+        adv_logits = self.domain_classifier(
+            trg_z_corr_for_selector
+        )
+
+        fool_as_source = torch.zeros(
+            trg_z_corr_for_selector.shape[0],
+            dtype=torch.long,
+            device=trg_z_corr_for_selector.device,
+        )
+
+        selector_adv_loss = self.cross_entropy(
+            adv_logits,
+            fool_as_source,
+        )
+
+        self.optimizer_selector.zero_grad()
+        selector_adv_loss.backward()
+        self.optimizer_selector.step()
+
+        self._set_requires_grad(
+            self.domain_classifier,
+            True,
+        )
+
+        alpha = selector_out["alpha"]
+        reliability = selector_out[
+            "reliability"
+        ]
+
+        with torch.no_grad():
+            alpha_entropy = -(
+                alpha
+                * torch.log(
+                    alpha.clamp_min(1e-8)
+                )
+            ).sum(dim=1).mean()
+
+        return {
+            "Domain_loss": float(
+                disc_loss.detach().item()
+            ),
+            "Domain_acc": float(
+                domain_acc.detach().item()
+            ),
+            "Selector_adv_loss": float(
+                selector_adv_loss.detach().item()
+            ),
+            "Alpha_identity": float(
+                alpha[:, 0].detach().mean().item()
+            ),
+            "Alpha_max": float(
+                alpha.detach().max(
+                    dim=1
+                ).values.mean().item()
+            ),
+            "Alpha_entropy": float(
+                alpha_entropy.item()
+            ),
+            "TSA_reliability": float(
+                reliability.detach().mean().item()
+            ),
         }
 
     @staticmethod
@@ -932,13 +1232,21 @@ class ACTA(Algorithm):
             ),
         }
 
-    def predict(self, data):
+    def predict(self, data, apply_correction=False):
         self.t_feature_extractor.eval()
         self.t_classifier.eval()
+        self.temporal_selector.eval()
 
         with torch.no_grad():
-            feat = self.t_feature_extractor(data)
-            pred = self.t_classifier(feat)
+            if (
+                apply_correction
+                and bool(self.tsa_ready.item())
+            ):
+                out = self.correct_target(data)
+                pred = out["corrected_logits"]
+            else:
+                feat = self.t_feature_extractor(data)
+                pred = self.t_classifier(feat)
 
         return pred
 
@@ -948,6 +1256,7 @@ class ACTA(Algorithm):
                 "t_encoder": self.t_feature_extractor.state_dict(),
                 "t_classifier": self.t_classifier.state_dict(),
                 "temporal_selector": self.temporal_selector.state_dict(),
+                "domain_classifier": self.domain_classifier.state_dict(),
                 "ema_encoder": self.ema_feature_extractor.state_dict(),
                 "ema_classifier": self.ema_classifier.state_dict(),
                 "tsa_mean_excess_risk": self.tsa_mean_excess_risk.detach().cpu(),
@@ -976,6 +1285,11 @@ class ACTA(Algorithm):
         if "temporal_selector" in checkpoint:
             self.temporal_selector.load_state_dict(
                 checkpoint["temporal_selector"]
+            )
+
+        if "domain_classifier" in checkpoint:
+            self.domain_classifier.load_state_dict(
+                checkpoint["domain_classifier"]
             )
 
         if "ema_encoder" in checkpoint:
@@ -1025,4 +1339,9 @@ class ACTA(Algorithm):
             self.tsa_ready.fill_(True)
 
         self._freeze_ema()
+
+        if bool(self.tsa_ready.item()):
+            self.freeze_task_model()
+            self.adaptation_prepared = True
+
         return self
