@@ -171,6 +171,18 @@ parser.add_argument(
     type=float,
 )
 
+parser.add_argument(
+    "--lambda_adv",
+    default=1.0,
+    type=float,
+)
+
+parser.add_argument(
+    "--lambda_dcg",
+    default=1.0,
+    type=float,
+)
+
 
 # ========= Phase =========
 parser.add_argument(

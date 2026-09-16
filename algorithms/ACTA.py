@@ -328,6 +328,25 @@ class ACTA(Algorithm):
             torch.tensor(False),
         )
 
+        # Static source task geometry used by DCG.
+        self.register_buffer(
+            "source_prototypes",
+            torch.zeros(
+                configs.num_classes,
+                configs.t_feat_dim,
+            ),
+        )
+        self.register_buffer(
+            "prototype_counts",
+            torch.zeros(
+                configs.num_classes,
+            ),
+        )
+        self.register_buffer(
+            "prototypes_ready",
+            torch.tensor(False),
+        )
+
         # Benchmark task model
         self.t_feature_extractor = CNN(configs)
         self.t_classifier = TemporalClassifierHead(
@@ -430,16 +449,14 @@ class ACTA(Algorithm):
 
     def _set_adaptation_task_mode(self):
         """
-        Source task model is frozen during adaptation.
+        Keep the source-certified task geometry deterministic.
 
-        We keep the encoder in train mode so Dropout remains active,
-        then explicitly freeze only BatchNorm running statistics.
+        Once the source model defines the TSA codebook and class
+        prototypes, both BatchNorm statistics and Dropout are frozen
+        by using eval mode throughout adaptation.
         """
-        self.t_feature_extractor.train()
+        self.t_feature_extractor.eval()
         self.t_classifier.eval()
-        self._freeze_bn_running_stats(
-            self.t_feature_extractor
-        )
 
     def freeze_task_model(self):
         self._set_requires_grad(
@@ -728,6 +745,192 @@ class ACTA(Algorithm):
 
         return alpha @ mappings
 
+    @torch.no_grad()
+    def build_source_prototypes(self, source_loader):
+        """
+        Build one normalized source prototype per class in z-space.
+
+        Prototypes are computed once from the converged, frozen source
+        task model. Target samples never update them.
+        """
+
+        self.t_feature_extractor.eval()
+        self.t_classifier.eval()
+
+        C = int(self.configs.num_classes)
+        D = int(self.t_feature_extractor.out_dim)
+
+        sums = torch.zeros(
+            C,
+            D,
+            device=self.device,
+        )
+        counts = torch.zeros(
+            C,
+            device=self.device,
+        )
+
+        for source_x, source_y in source_loader:
+            source_x = source_x.float().to(
+                self.device
+            )
+            source_y = source_y.long().to(
+                self.device
+            )
+
+            z = self.t_feature_extractor(
+                source_x
+            )
+
+            for c in range(C):
+                mask = source_y == c
+
+                if not mask.any():
+                    continue
+
+                sums[c] += z[mask].sum(
+                    dim=0
+                )
+                counts[c] += mask.sum()
+
+        if torch.any(counts <= 0):
+            missing = torch.where(
+                counts <= 0
+            )[0].tolist()
+
+            raise RuntimeError(
+                "Cannot build source prototypes; "
+                f"missing classes: {missing}"
+            )
+
+        prototypes = (
+            sums
+            /
+            counts[:, None]
+        )
+
+        prototypes = F.normalize(
+            prototypes,
+            dim=1,
+        )
+
+        self.source_prototypes.copy_(
+            prototypes
+        )
+        self.prototype_counts.copy_(
+            counts
+        )
+        self.prototypes_ready.fill_(True)
+
+        return {
+            "prototype_min_count": float(
+                counts.min().item()
+            ),
+            "prototype_max_count": float(
+                counts.max().item()
+            ),
+        }
+
+    def prototype_relative_score(
+        self,
+        z,
+        class_probs,
+    ):
+        """
+        Relative task-structure score R(z).
+
+        For class c:
+            d_c(z) = 1 - cos(z, mu_c)
+
+        and:
+            r_c(z)
+              =
+              d_c(z)
+              -
+              mean_{k != c} d_k(z)
+
+        Finally:
+            R(z)
+              =
+              sum_c p(c|x) r_c(z)
+
+        Lower is better: the representation is relatively closer to
+        likely source classes than to their competing classes.
+        """
+
+        if not bool(
+            self.prototypes_ready.item()
+        ):
+            raise RuntimeError(
+                "Source prototypes are not ready."
+            )
+
+        if z.ndim != 2:
+            raise ValueError(
+                "z must have shape [B, D]."
+            )
+
+        if class_probs.ndim != 2:
+            raise ValueError(
+                "class_probs must have shape [B, C]."
+            )
+
+        C = int(
+            self.source_prototypes.shape[0]
+        )
+
+        if C < 2:
+            raise RuntimeError(
+                "DCG requires at least two classes."
+            )
+
+        z_norm = F.normalize(
+            z,
+            dim=1,
+        )
+
+        prototypes = F.normalize(
+            self.source_prototypes,
+            dim=1,
+        )
+
+        cosine = (
+            z_norm
+            @
+            prototypes.t()
+        )
+
+        distance = 1.0 - cosine
+
+        other_mean = (
+            distance.sum(
+                dim=1,
+                keepdim=True,
+            )
+            -
+            distance
+        ) / float(C - 1)
+
+        relative = (
+            distance
+            -
+            other_mean
+        )
+
+        probs = class_probs.detach()
+        probs = probs / probs.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1e-12)
+
+        score = (
+            probs
+            *
+            relative
+        ).sum(dim=1)
+
+        return score
+
     def source_update(self, src_x, src_y):
         """
         Supervised source pretraining step.
@@ -773,6 +976,16 @@ class ACTA(Algorithm):
 
         summary = self.build_tsa_codebook(
             source_loader
+        )
+
+        prototype_summary = (
+            self.build_source_prototypes(
+                source_loader
+            )
+        )
+
+        summary.update(
+            prototype_summary
         )
 
         self.freeze_task_model()
@@ -924,8 +1137,68 @@ class ACTA(Algorithm):
             fool_as_source,
         )
 
+        # --------------------------------------------------
+        # Discriminative Correction Gain (DCG)
+        # --------------------------------------------------
+        # Use the same soft EMA target probabilities already used
+        # by TSA. No hard pseudo-label and no confidence threshold.
+        class_probs = selector_out[
+            "class_probs"
+        ].detach()
+
+        baseline_score = (
+            self.prototype_relative_score(
+                selector_out["z_t"].detach(),
+                class_probs,
+            )
+            .detach()
+        )
+
+        corrected_score = (
+            self.prototype_relative_score(
+                trg_z_corr_for_selector,
+                class_probs,
+            )
+        )
+
+        dcg_violation = (
+            corrected_score
+            -
+            baseline_score
+        )
+
+        dcg_loss = F.relu(
+            dcg_violation
+        ).mean()
+
+        lambda_adv = float(
+            getattr(
+                self.args,
+                "lambda_adv",
+                1.0,
+            )
+        )
+
+        lambda_dcg = float(
+            getattr(
+                self.args,
+                "lambda_dcg",
+                1.0,
+            )
+        )
+
+        selector_loss = (
+            lambda_adv
+            *
+            selector_adv_loss
+            +
+            lambda_dcg
+            *
+            dcg_loss
+        )
+
         self.optimizer_selector.zero_grad()
-        selector_adv_loss.backward()
+        selector_loss.backward()
         self.optimizer_selector.step()
 
         self._set_requires_grad(
@@ -946,6 +1219,16 @@ class ACTA(Algorithm):
                 )
             ).sum(dim=1).mean()
 
+            dcg_gain = (
+                baseline_score
+                -
+                corrected_score
+            ).mean()
+
+            dcg_active_rate = (
+                dcg_violation > 0.0
+            ).float().mean()
+
         return {
             "Domain_loss": float(
                 disc_loss.detach().item()
@@ -955,6 +1238,18 @@ class ACTA(Algorithm):
             ),
             "Selector_adv_loss": float(
                 selector_adv_loss.detach().item()
+            ),
+            "DCG_loss": float(
+                dcg_loss.detach().item()
+            ),
+            "Selector_loss": float(
+                selector_loss.detach().item()
+            ),
+            "DCG_gain": float(
+                dcg_gain.detach().item()
+            ),
+            "DCG_active_rate": float(
+                dcg_active_rate.detach().item()
             ),
             "Alpha_identity": float(
                 alpha[:, 0].detach().mean().item()
@@ -1265,6 +1560,9 @@ class ACTA(Algorithm):
                 "tsa_order_stability": self.tsa_order_stability.detach().cpu(),
                 "tsa_kappa": self.tsa_kappa.detach().cpu(),
                 "tsa_ready": bool(self.tsa_ready.item()),
+                "source_prototypes": self.source_prototypes.detach().cpu(),
+                "prototype_counts": self.prototype_counts.detach().cpu(),
+                "prototypes_ready": bool(self.prototypes_ready.item()),
             },
             path,
         )
@@ -1338,9 +1636,35 @@ class ACTA(Algorithm):
         if bool(checkpoint.get("tsa_ready", False)):
             self.tsa_ready.fill_(True)
 
+        if "source_prototypes" in checkpoint:
+            self.source_prototypes.copy_(
+                checkpoint["source_prototypes"].to(
+                    self.device
+                )
+            )
+
+        if "prototype_counts" in checkpoint:
+            self.prototype_counts.copy_(
+                checkpoint["prototype_counts"].to(
+                    self.device
+                )
+            )
+
+        if bool(
+            checkpoint.get(
+                "prototypes_ready",
+                False,
+            )
+        ):
+            self.prototypes_ready.fill_(True)
+
         self._freeze_ema()
 
-        if bool(self.tsa_ready.item()):
+        if (
+            bool(self.tsa_ready.item())
+            and
+            bool(self.prototypes_ready.item())
+        ):
             self.freeze_task_model()
             self.adaptation_prepared = True
 
