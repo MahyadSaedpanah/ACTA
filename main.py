@@ -139,6 +139,12 @@ parser.add_argument(
     type=float,
 )
 
+parser.add_argument(
+    "--selector_hid_dim",
+    default=128,
+    type=int,
+)
+
 
 # ========= Phase =========
 parser.add_argument(
