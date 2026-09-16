@@ -2,6 +2,7 @@ import copy
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from algorithms.algorithms_base import Algorithm
 from utils.module import *
@@ -382,6 +383,100 @@ class ACTA(Algorithm):
         logits = self.ema_classifier(feat)
 
         return torch.softmax(logits, dim=-1)
+
+    @torch.no_grad()
+    def tsa_gate_from_probs(self, class_probs):
+        """
+        Convert target class probabilities into per-warp semantic
+        admissibility weights.
+
+        class_probs:
+            [B, C]
+
+        Returns:
+            gate:        [B, M]
+            raw_safety:  [B, M]
+            reliability: [B]
+
+        Definitions:
+            s_m(x) = sum_c p(c|x) A[c,m]
+
+            r(x) = sum_c p(c|x) kappa[c]
+
+            gate_m(x)
+              = (1-r(x)) * 1
+                + r(x) * s_m(x)
+
+        Therefore:
+            - high source-side reliability -> class-conditioned TSA acts
+            - low source-side reliability  -> gate becomes neutral
+            - identity is always exactly 1
+        """
+
+        if not bool(self.tsa_ready.item()):
+            raise RuntimeError(
+                "TSA codebook is not ready. "
+                "Build it from source data first."
+            )
+
+        if class_probs.ndim != 2:
+            raise ValueError(
+                "class_probs must have shape [B, C]."
+            )
+
+        if class_probs.shape[1] != self.tsa_rank_score.shape[0]:
+            raise ValueError(
+                "Class dimension does not match TSA codebook."
+            )
+
+        probs = class_probs.to(
+            device=self.tsa_rank_score.device,
+            dtype=self.tsa_rank_score.dtype,
+        )
+
+        # Numerical normalization only; this does not sharpen or
+        # threshold the prediction distribution.
+        probs = probs.clamp_min(0.0)
+        probs = probs / probs.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1e-12)
+
+        raw_safety = probs @ self.tsa_rank_score
+
+        reliability = (
+            probs @ self.tsa_kappa
+        ).clamp(0.0, 1.0)
+
+        gate = (
+            (1.0 - reliability[:, None])
+            +
+            reliability[:, None] * raw_safety
+        )
+
+        # Identity is the no-correction action and must never be
+        # suppressed by semantic gating.
+        gate[:, 0] = 1.0
+
+        return gate, raw_safety, reliability
+
+    @torch.no_grad()
+    def target_tsa_gate(self, target_x):
+        """
+        EMA target prediction -> target-specific TSA soft gate.
+        """
+        class_probs = self.ema_predict(target_x)
+
+        gate, raw_safety, reliability = (
+            self.tsa_gate_from_probs(class_probs)
+        )
+
+        return {
+            "class_probs": class_probs,
+            "gate": gate,
+            "raw_safety": raw_safety,
+            "reliability": reliability,
+        }
 
     def update(self, src_x, src_y, trg_x):
         """

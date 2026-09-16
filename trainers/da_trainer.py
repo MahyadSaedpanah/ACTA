@@ -239,6 +239,44 @@ class da_trainer(object):
                         "TSA codebook: {}".format(tsa_summary)
                     )
 
+                    # Stage-4 diagnostic only:
+                    # compute the target-specific TSA gate on one
+                    # unlabeled target batch. No optimization uses it yet.
+                    if hasattr(algorithm, "target_tsa_gate"):
+                        target_batch = next(iter(self.trg_train_dl))
+                        target_x = target_batch[0].float().to(
+                            self.device
+                        )
+
+                        gate_out = algorithm.target_tsa_gate(
+                            target_x
+                        )
+
+                        gate = gate_out["gate"]
+                        reliability = gate_out["reliability"]
+
+                        self.logger.debug(
+                            "TSA gate diagnostic: {}".format(
+                                {
+                                    "reliability_mean": float(
+                                        reliability.mean().item()
+                                    ),
+                                    "gate_nonidentity_mean": float(
+                                        gate[:, 1:].mean().item()
+                                    ),
+                                    "gate_nonidentity_min": float(
+                                        gate[:, 1:].min().item()
+                                    ),
+                                    "gate_nonidentity_max": float(
+                                        gate[:, 1:].max().item()
+                                    ),
+                                    "identity_mean": float(
+                                        gate[:, 0].mean().item()
+                                    ),
+                                }
+                            )
+                        )
+
                 # Save the final-epoch model only.
                 # This avoids target-label model selection during UDA training.
                 self.logger.debug('Saving ACTA final-epoch model')
