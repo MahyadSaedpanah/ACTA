@@ -243,6 +243,34 @@ class TemporalWarpBank(nn.Module):
         return corrected.squeeze(2)
 
 
+
+class TemporalSelector(nn.Module):
+    """
+    Small sample-specific selector over the fixed temporal action bank.
+
+    Input:
+        z_t: [B, D]
+
+    Output:
+        q: [B, M] unconstrained selector logits
+
+    TSA does not appear as a loss here. It modifies these logits through
+    the semantic gate before the final softmax.
+    """
+
+    def __init__(self, in_dim, hidden_dim, num_warps):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_warps),
+        )
+
+    def forward(self, z):
+        return self.net(z)
+
+
 class ACTA(Algorithm):
     """
     ACTA - clean implementation skeleton.
@@ -304,6 +332,17 @@ class ACTA(Algorithm):
         self.t_classifier = TemporalClassifierHead(
             self.t_feature_extractor.out_dim,
             configs.num_classes,
+        )
+
+        # Sample-specific temporal selector.
+        self.selector_hidden_dim = int(
+            getattr(args, "selector_hid_dim", 128)
+        )
+
+        self.temporal_selector = TemporalSelector(
+            in_dim=self.t_feature_extractor.out_dim,
+            hidden_dim=self.selector_hidden_dim,
+            num_warps=self.warp_bank.num_warps,
         )
 
         # EMA teacher
@@ -476,6 +515,59 @@ class ACTA(Algorithm):
             "gate": gate,
             "raw_safety": raw_safety,
             "reliability": reliability,
+        }
+
+    def selector_weights_from_target(self, target_x):
+        """
+        Produce TSA-constrained selector weights.
+
+        First pass:
+            x_t -> CNN -> z_t
+
+        Selector:
+            z_t -> q
+
+        TSA gate:
+            target EMA probabilities -> gate
+
+        Final action weights:
+            alpha_m
+              =
+              softmax(
+                  q_m + log(gate_m + eps)
+              )
+
+        The gate is detached because it is source-derived semantic
+        structure plus frozen EMA target probabilities. The trainable
+        quantity in the selector path is q.
+
+        No correction is applied in Stage 5 yet.
+        """
+
+        z_t = self.t_feature_extractor(target_x)
+
+        # The selector should learn how to choose corrections; the
+        # benchmark CNN is not updated by selector objectives.
+        q = self.temporal_selector(z_t.detach())
+
+        with torch.no_grad():
+            gate_out = self.target_tsa_gate(target_x)
+
+        gate = gate_out["gate"].detach()
+
+        alpha = torch.softmax(
+            q + torch.log(gate.clamp_min(1e-8)),
+            dim=1,
+        )
+
+        return {
+            "z_t": z_t,
+            "selector_logits": q,
+            "alpha": alpha,
+            "gate": gate,
+            "raw_safety": gate_out["raw_safety"],
+            "reliability": gate_out["reliability"],
+            "class_probs": gate_out["class_probs"],
         }
 
     def update(self, src_x, src_y, trg_x):
@@ -784,6 +876,7 @@ class ACTA(Algorithm):
             {
                 "t_encoder": self.t_feature_extractor.state_dict(),
                 "t_classifier": self.t_classifier.state_dict(),
+                "temporal_selector": self.temporal_selector.state_dict(),
                 "ema_encoder": self.ema_feature_extractor.state_dict(),
                 "ema_classifier": self.ema_classifier.state_dict(),
                 "tsa_mean_excess_risk": self.tsa_mean_excess_risk.detach().cpu(),
@@ -808,6 +901,11 @@ class ACTA(Algorithm):
         self.t_classifier.load_state_dict(
             checkpoint["t_classifier"]
         )
+
+        if "temporal_selector" in checkpoint:
+            self.temporal_selector.load_state_dict(
+                checkpoint["temporal_selector"]
+            )
 
         if "ema_encoder" in checkpoint:
             self.ema_feature_extractor.load_state_dict(

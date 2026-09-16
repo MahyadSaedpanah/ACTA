@@ -248,15 +248,25 @@ class da_trainer(object):
                             self.device
                         )
 
-                        gate_out = algorithm.target_tsa_gate(
-                            target_x
+                        selector_out = (
+                            algorithm.selector_weights_from_target(
+                                target_x
+                            )
                         )
 
-                        gate = gate_out["gate"]
-                        reliability = gate_out["reliability"]
+                        gate = selector_out["gate"]
+                        reliability = selector_out["reliability"]
+                        alpha = selector_out["alpha"]
+
+                        entropy = -(
+                            alpha
+                            * torch.log(
+                                alpha.clamp_min(1e-8)
+                            )
+                        ).sum(dim=1)
 
                         self.logger.debug(
-                            "TSA gate diagnostic: {}".format(
+                            "TSA selector diagnostic: {}".format(
                                 {
                                     "reliability_mean": float(
                                         reliability.mean().item()
@@ -264,14 +274,23 @@ class da_trainer(object):
                                     "gate_nonidentity_mean": float(
                                         gate[:, 1:].mean().item()
                                     ),
-                                    "gate_nonidentity_min": float(
-                                        gate[:, 1:].min().item()
-                                    ),
-                                    "gate_nonidentity_max": float(
-                                        gate[:, 1:].max().item()
-                                    ),
-                                    "identity_mean": float(
+                                    "identity_gate_mean": float(
                                         gate[:, 0].mean().item()
+                                    ),
+                                    "alpha_identity_mean": float(
+                                        alpha[:, 0].mean().item()
+                                    ),
+                                    "alpha_max_mean": float(
+                                        alpha.max(dim=1).values.mean().item()
+                                    ),
+                                    "alpha_entropy_mean": float(
+                                        entropy.mean().item()
+                                    ),
+                                    "alpha_row_sum_error": float(
+                                        (
+                                            alpha.sum(dim=1)
+                                            - 1.0
+                                        ).abs().max().item()
                                     ),
                                 }
                             )
